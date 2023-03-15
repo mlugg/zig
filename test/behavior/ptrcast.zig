@@ -278,7 +278,7 @@ test "@ptrCast undefined value at comptime" {
         }
     };
     comptime {
-        var x = S.transmute([]u8, i32, undefined);
+        var x = S.transmute(f64, i32, undefined);
         _ = x;
     }
 }

@@ -412,3 +412,148 @@ test "bitcast packed union to integer" {
         try testing.expectEqual(@as(u2, 2), cast_b);
     }
 }
+
+test "update field from undefined by pointer" {
+    comptime {
+        const S = struct { a: u32, b: u32 };
+        var s: S = undefined;
+        const field_ptr = &s.a;
+        field_ptr.* = 5;
+        try testing.expectEqual(5, s.a);
+    }
+}
+
+test "assign full slice of defined-layout type" {
+    comptime {
+        var vals: [4]u32 = undefined;
+        const x: [2]u32 = .{ 42, 64 }; // Avoid RLS
+        vals[1..3].* = x;
+        vals[0] = 0;
+        vals[3] = 1;
+        try testing.expectEqualSlices(u32, &.{ 0, 42, 64, 1 }, &vals);
+    }
+}
+
+test "assign full slice of undefined-layout type" {
+    comptime {
+        var vals: [4]type = undefined;
+        const x: [2]type = .{ u42, u64 }; // Avoid RLS
+        vals[1..3].* = x;
+        vals[0] = u0;
+        vals[3] = u1;
+        try testing.expectEqualSlices(type, &.{ u0, u42, u64, u1 }, &vals);
+    }
+}
+
+test "reinterpret extern struct crossing fields" {
+    comptime {
+        const S = extern struct { x: u16, y: u16 };
+        const s: S = .{ .x = 19000, .y = 19600 };
+
+        const exp = if (endian == .Little) 75649472.0 else 3019556.0;
+        try testing.expectEqual(exp, @bitCast(f32, s));
+        try testing.expectEqual(exp, @ptrCast(*align(1) const f32, &s).*);
+    }
+}
+
+test "dereference slice from start of array" {
+    comptime {
+        const T = struct { x: u32 = 42 };
+        const elems: []const T = &.{ .{}, .{}, .{} };
+        const s = elems[0..2].*;
+        try testing.expectEqual(42, s[0].x);
+        try testing.expectEqual(42, s[1].x);
+    }
+}
+
+test "dereference slice from middle of array" {
+    comptime {
+        const T = struct { x: u32 = 42 };
+        const elems: []const T = &.{ .{}, .{}, .{} };
+        const s = elems[1..3].*;
+        try testing.expectEqual(42, s[0].x);
+        try testing.expectEqual(42, s[1].x);
+    }
+}
+
+test "dereferenced array refers to different memory" {
+    comptime {
+        var elems: [4]u32 = .{ 1, 2, 3, 4 };
+        const sub = elems[0..2].*;
+        elems[0] = 10;
+        elems[1] = 20;
+        try testing.expectEqualSlices(u32, &.{ 1, 2 }, &sub);
+        try testing.expectEqualSlices(u32, &.{ 10, 20, 3, 4 }, &elems);
+    }
+}
+
+test "restructure array of u32" {
+    comptime {
+        var types: [2][3]u32 = .{ .{ 1, 2, 3 }, .{ 4, 5, 6 } };
+        const p = @ptrCast(*[3][2]u32, &types);
+        p[1] = .{ 10, 20 };
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 10 }, &types[0]);
+        try testing.expectEqualSlices(u32, &.{ 20, 5, 6 }, &types[1]);
+        const flat = @ptrCast(*[6]u32, &types);
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 10, 20, 5, 6 }, flat);
+    }
+}
+
+test "restructure array of type" {
+    comptime {
+        var types: [2][3]type = .{ .{ u1, u2, u3 }, .{ u4, u5, u6 } };
+        const p = @ptrCast(*[3][2]type, &types);
+        p[1] = .{ i10, i20 };
+        try testing.expectEqualSlices(type, &.{ u1, u2, i10 }, &types[0]);
+        try testing.expectEqualSlices(type, &.{ i20, u5, u6 }, &types[1]);
+        const flat = @ptrCast(*[6]type, &types);
+        try testing.expectEqualSlices(type, &.{ u1, u2, i10, i20, u5, u6 }, flat);
+    }
+}
+
+test "reinterpret well-defined layout field of undefined layout struct" {
+    comptime {
+        const S = struct {
+            sub: extern struct { x: u8, y: u8 },
+            foo: u32,
+            bar: u64,
+        };
+        const s: S = .{
+            .sub = .{ .x = 10, .y = 20 },
+            .foo = 1234,
+            .bar = 12345678,
+        };
+
+        const exp = if (endian == .Little) 5130 else 2580;
+        try testing.expectEqual(exp, @bitCast(u16, s.sub));
+        try testing.expectEqual(exp, @ptrCast(*align(1) const u16, &s.sub).*);
+    }
+}
+
+test "eliminate multiple array dimensions of undefined-layout type through pointer" {
+    comptime {
+        const arr: [2][2][2]type = .{
+            .{ .{ u0, u1 }, .{ u2, u3 } },
+            .{ .{ u4, u5 }, .{ u6, u7 } },
+        };
+
+        const a = @ptrCast(*const [2][4]type, &arr);
+        try testing.expectEqualSlices(type, &.{ u0, u1, u2, u3 }, &a[0]);
+        try testing.expectEqualSlices(type, &.{ u4, u5, u6, u7 }, &a[1]);
+
+        const b = @ptrCast(*const [4][2]type, &arr);
+        try testing.expectEqualSlices(type, &.{ u0, u1 }, &b[0]);
+        try testing.expectEqualSlices(type, &.{ u2, u3 }, &b[1]);
+        try testing.expectEqualSlices(type, &.{ u4, u5 }, &b[2]);
+        try testing.expectEqualSlices(type, &.{ u6, u7 }, &b[3]);
+
+        const c = @ptrCast(*const [8]type, &arr);
+        try testing.expectEqualSlices(type, &.{ u0, u1, u2, u3, u4, u5, u6, u7 }, c);
+
+        const d = @ptrCast(*const [1][1][1][1][1][8]type, &arr);
+        try testing.expectEqualSlices(type, &.{ u0, u1, u2, u3, u4, u5, u6, u7 }, &d[0][0][0][0][0]);
+
+        const e = @ptrCast(*const type, &arr);
+        try testing.expectEqual(u0, e.*);
+    }
+}
