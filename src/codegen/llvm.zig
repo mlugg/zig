@@ -4522,6 +4522,10 @@ pub const FuncGen = struct {
     fn genBody(self: *FuncGen, body: []const Air.Inst.Index) Error!void {
         const air_tags = self.air.instructions.items(.tag);
         for (body, 0..) |inst, i| {
+            if (self.liveness.isUnused(inst) and !self.air.mustLower(inst)) {
+                continue;
+            }
+
             const opt_value: ?*llvm.Value = switch (air_tags[inst]) {
                 // zig fmt: off
                 .add       => try self.airAdd(inst, false),
@@ -5165,8 +5169,6 @@ pub const FuncGen = struct {
     }
 
     fn airCVaArg(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const list = try self.resolveInst(ty_op.operand);
         const arg_ty = self.air.getRefType(ty_op.ty);
@@ -5176,8 +5178,6 @@ pub const FuncGen = struct {
     }
 
     fn airCVaCopy(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const src_list = try self.resolveInst(ty_op.operand);
         const va_list_ty = self.air.getRefType(ty_op.ty);
@@ -5225,8 +5225,6 @@ pub const FuncGen = struct {
     }
 
     fn airCVaStart(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const va_list_ty = self.air.typeOfIndex(inst);
         const llvm_va_list_ty = try self.dg.lowerType(va_list_ty);
 
@@ -5253,7 +5251,6 @@ pub const FuncGen = struct {
     }
 
     fn airCmp(self: *FuncGen, inst: Air.Inst.Index, op: math.CompareOperator, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -5265,7 +5262,6 @@ pub const FuncGen = struct {
     }
 
     fn airCmpVector(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
@@ -5280,8 +5276,6 @@ pub const FuncGen = struct {
     }
 
     fn airCmpLtErrorsLen(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const llvm_fn = try self.getCmpLtErrorsLenFunction();
@@ -5649,9 +5643,6 @@ pub const FuncGen = struct {
     }
 
     fn airArrayToSlice(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand_ty = self.air.typeOf(ty_op.operand);
         const array_ty = operand_ty.childType();
@@ -5673,9 +5664,6 @@ pub const FuncGen = struct {
     }
 
     fn airIntToFloat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
 
         const operand = try self.resolveInst(ty_op.operand);
@@ -5732,9 +5720,6 @@ pub const FuncGen = struct {
     }
 
     fn airFloatToInt(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         self.builder.setFastMath(want_fast_math);
 
         const target = self.dg.module.getTarget();
@@ -5791,16 +5776,12 @@ pub const FuncGen = struct {
     }
 
     fn airSliceField(self: *FuncGen, inst: Air.Inst.Index, index: c_uint) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         return self.builder.buildExtractValue(operand, index, "");
     }
 
     fn airPtrSliceFieldPtr(self: *FuncGen, inst: Air.Inst.Index, index: c_uint) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const slice_ptr = try self.resolveInst(ty_op.operand);
         const slice_ptr_ty = self.air.typeOf(ty_op.operand);
@@ -5813,8 +5794,6 @@ pub const FuncGen = struct {
         const inst = body_tail[0];
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const slice_ty = self.air.typeOf(bin_op.lhs);
-        if (!slice_ty.isVolatilePtr() and self.liveness.isUnused(inst)) return null;
-
         const slice = try self.resolveInst(bin_op.lhs);
         const index = try self.resolveInst(bin_op.rhs);
         const elem_ty = slice_ty.childType();
@@ -5834,7 +5813,6 @@ pub const FuncGen = struct {
     }
 
     fn airSliceElemPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const slice_ty = self.air.typeOf(bin_op.lhs);
@@ -5849,7 +5827,6 @@ pub const FuncGen = struct {
 
     fn airArrayElemVal(self: *FuncGen, body_tail: []const Air.Inst.Index) !?*llvm.Value {
         const inst = body_tail[0];
-        if (self.liveness.isUnused(inst)) return null;
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const array_ty = self.air.typeOf(bin_op.lhs);
@@ -5880,8 +5857,6 @@ pub const FuncGen = struct {
         const inst = body_tail[0];
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const ptr_ty = self.air.typeOf(bin_op.lhs);
-        if (!ptr_ty.isVolatilePtr() and self.liveness.isUnused(inst)) return null;
-
         const elem_ty = ptr_ty.childType();
         const llvm_elem_ty = try self.dg.lowerPtrElemTy(elem_ty);
         const base_ptr = try self.resolveInst(bin_op.lhs);
@@ -5907,8 +5882,6 @@ pub const FuncGen = struct {
     }
 
     fn airPtrElemPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const ptr_ty = self.air.typeOf(bin_op.lhs);
@@ -5933,9 +5906,6 @@ pub const FuncGen = struct {
     }
 
     fn airStructFieldPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const struct_field = self.air.extraData(Air.StructField, ty_pl.payload).data;
         const struct_ptr = try self.resolveInst(struct_field.struct_operand);
@@ -5948,8 +5918,6 @@ pub const FuncGen = struct {
         inst: Air.Inst.Index,
         field_index: u32,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const struct_ptr = try self.resolveInst(ty_op.operand);
         const struct_ptr_ty = self.air.typeOf(ty_op.operand);
@@ -5958,8 +5926,6 @@ pub const FuncGen = struct {
 
     fn airStructFieldVal(self: *FuncGen, body_tail: []const Air.Inst.Index) !?*llvm.Value {
         const inst = body_tail[0];
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const struct_field = self.air.extraData(Air.StructField, ty_pl.payload).data;
         const struct_ty = self.air.typeOf(struct_field.struct_operand);
@@ -6059,8 +6025,6 @@ pub const FuncGen = struct {
     }
 
     fn airFieldParentPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const extra = self.air.extraData(Air.FieldParentPtr, ty_pl.payload).data;
 
@@ -6082,9 +6046,6 @@ pub const FuncGen = struct {
     }
 
     fn airNot(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
 
@@ -6261,8 +6222,6 @@ pub const FuncGen = struct {
         const is_volatile = @truncate(u1, extra.data.flags >> 31) != 0;
         const clobbers_len = @truncate(u31, extra.data.flags);
         var extra_i: usize = extra.end;
-
-        if (!is_volatile and self.liveness.isUnused(inst)) return null;
 
         const outputs = @ptrCast([]const Air.Inst.Ref, self.air.extra[extra_i..][0..extra.data.outputs_len]);
         extra_i += outputs.len;
@@ -6609,8 +6568,6 @@ pub const FuncGen = struct {
         operand_is_ptr: bool,
         pred: llvm.IntPredicate,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const operand_ty = self.air.typeOf(un_op);
@@ -6658,8 +6615,6 @@ pub const FuncGen = struct {
         op: llvm.IntPredicate,
         operand_is_ptr: bool,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const operand_ty = self.air.typeOf(un_op);
@@ -6700,8 +6655,6 @@ pub const FuncGen = struct {
     }
 
     fn airOptionalPayloadPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const optional_ty = self.air.typeOf(ty_op.operand).childType();
@@ -6755,8 +6708,6 @@ pub const FuncGen = struct {
 
     fn airOptionalPayload(self: *FuncGen, body_tail: []const Air.Inst.Index) !?*llvm.Value {
         const inst = body_tail[0];
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const optional_ty = self.air.typeOf(ty_op.operand);
@@ -6779,8 +6730,6 @@ pub const FuncGen = struct {
         operand_is_ptr: bool,
     ) !?*llvm.Value {
         const inst = body_tail[0];
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const operand_ty = self.air.typeOf(ty_op.operand);
@@ -6816,9 +6765,6 @@ pub const FuncGen = struct {
         inst: Air.Inst.Index,
         operand_is_ptr: bool,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const operand_ty = self.air.typeOf(ty_op.operand);
@@ -6892,8 +6838,6 @@ pub const FuncGen = struct {
     }
 
     fn airSaveErrReturnTraceIndex(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.module.getTarget();
 
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
@@ -6910,8 +6854,6 @@ pub const FuncGen = struct {
     }
 
     fn airWrapOptional(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const payload_ty = self.air.typeOf(ty_op.operand);
         const non_null_bit = self.context.intType(8).constInt(1, .False);
@@ -6942,8 +6884,6 @@ pub const FuncGen = struct {
     }
 
     fn airWrapErrUnionPayload(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const err_un_ty = self.air.typeOfIndex(inst);
         const operand = try self.resolveInst(ty_op.operand);
@@ -6977,8 +6917,6 @@ pub const FuncGen = struct {
     }
 
     fn airWrapErrUnionErr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const err_un_ty = self.air.typeOfIndex(inst);
         const payload_ty = err_un_ty.errorUnionPayload();
@@ -7014,8 +6952,6 @@ pub const FuncGen = struct {
     }
 
     fn airWasmMemorySize(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const pl_op = self.air.instructions.items(.data)[inst].pl_op;
         const index = pl_op.payload;
         const llvm_u32 = self.context.intType(32);
@@ -7060,8 +6996,6 @@ pub const FuncGen = struct {
     }
 
     fn airMin(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7073,8 +7007,6 @@ pub const FuncGen = struct {
     }
 
     fn airMax(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7086,8 +7018,6 @@ pub const FuncGen = struct {
     }
 
     fn airSlice(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const ptr = try self.resolveInst(bin_op.lhs);
@@ -7102,7 +7032,6 @@ pub const FuncGen = struct {
     }
 
     fn airAdd(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7117,7 +7046,6 @@ pub const FuncGen = struct {
     }
 
     fn airAddWrap(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7128,8 +7056,6 @@ pub const FuncGen = struct {
     }
 
     fn airAddSat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7143,7 +7069,6 @@ pub const FuncGen = struct {
     }
 
     fn airSub(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7158,7 +7083,6 @@ pub const FuncGen = struct {
     }
 
     fn airSubWrap(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7169,8 +7093,6 @@ pub const FuncGen = struct {
     }
 
     fn airSubSat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7183,7 +7105,6 @@ pub const FuncGen = struct {
     }
 
     fn airMul(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7198,7 +7119,6 @@ pub const FuncGen = struct {
     }
 
     fn airMulWrap(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7209,8 +7129,6 @@ pub const FuncGen = struct {
     }
 
     fn airMulSat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7223,7 +7141,6 @@ pub const FuncGen = struct {
     }
 
     fn airDivFloat(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7235,7 +7152,6 @@ pub const FuncGen = struct {
     }
 
     fn airDivTrunc(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7253,7 +7169,6 @@ pub const FuncGen = struct {
     }
 
     fn airDivFloor(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7286,7 +7201,6 @@ pub const FuncGen = struct {
     }
 
     fn airDivExact(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7301,7 +7215,6 @@ pub const FuncGen = struct {
     }
 
     fn airRem(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7316,7 +7229,6 @@ pub const FuncGen = struct {
     }
 
     fn airMod(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
@@ -7346,8 +7258,6 @@ pub const FuncGen = struct {
     }
 
     fn airPtrAdd(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const base_ptr = try self.resolveInst(bin_op.lhs);
@@ -7367,8 +7277,6 @@ pub const FuncGen = struct {
     }
 
     fn airPtrSub(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const bin_op = self.air.extraData(Air.Bin, ty_pl.payload).data;
         const base_ptr = try self.resolveInst(bin_op.lhs);
@@ -7394,9 +7302,6 @@ pub const FuncGen = struct {
         signed_intrinsic: []const u8,
         unsigned_intrinsic: []const u8,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const extra = self.air.extraData(Air.Bin, ty_pl.payload).data;
 
@@ -7685,8 +7590,6 @@ pub const FuncGen = struct {
     }
 
     fn airMulAdd(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const pl_op = self.air.instructions.items(.data)[inst].pl_op;
         const extra = self.air.extraData(Air.Bin, pl_op.payload).data;
 
@@ -7699,9 +7602,6 @@ pub const FuncGen = struct {
     }
 
     fn airShlWithOverflow(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const extra = self.air.extraData(Air.Bin, ty_pl.payload).data;
 
@@ -7758,8 +7658,6 @@ pub const FuncGen = struct {
     }
 
     fn airAnd(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7767,8 +7665,6 @@ pub const FuncGen = struct {
     }
 
     fn airOr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7776,8 +7672,6 @@ pub const FuncGen = struct {
     }
 
     fn airXor(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
         const lhs = try self.resolveInst(bin_op.lhs);
         const rhs = try self.resolveInst(bin_op.rhs);
@@ -7785,8 +7679,6 @@ pub const FuncGen = struct {
     }
 
     fn airShlExact(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
 
         const lhs = try self.resolveInst(bin_op.lhs);
@@ -7808,8 +7700,6 @@ pub const FuncGen = struct {
     }
 
     fn airShl(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
 
         const lhs = try self.resolveInst(bin_op.lhs);
@@ -7830,8 +7720,6 @@ pub const FuncGen = struct {
     }
 
     fn airShlSat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
 
         const lhs = try self.resolveInst(bin_op.lhs);
@@ -7875,8 +7763,6 @@ pub const FuncGen = struct {
     }
 
     fn airShr(self: *FuncGen, inst: Air.Inst.Index, is_exact: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const bin_op = self.air.instructions.items(.data)[inst].bin_op;
 
         const lhs = try self.resolveInst(bin_op.lhs);
@@ -7911,9 +7797,6 @@ pub const FuncGen = struct {
     }
 
     fn airIntCast(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const target = self.dg.module.getTarget();
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const dest_ty = self.air.typeOfIndex(inst);
@@ -7936,8 +7819,6 @@ pub const FuncGen = struct {
     }
 
     fn airTrunc(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const dest_llvm_ty = try self.dg.lowerType(self.air.typeOfIndex(inst));
@@ -7945,9 +7826,6 @@ pub const FuncGen = struct {
     }
 
     fn airFptrunc(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const operand_ty = self.air.typeOf(ty_op.operand);
@@ -7977,9 +7855,6 @@ pub const FuncGen = struct {
     }
 
     fn airFpext(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const operand_ty = self.air.typeOf(ty_op.operand);
@@ -8009,9 +7884,6 @@ pub const FuncGen = struct {
     }
 
     fn airPtrToInt(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const dest_llvm_ty = try self.dg.lowerType(self.air.typeOfIndex(inst));
@@ -8019,8 +7891,6 @@ pub const FuncGen = struct {
     }
 
     fn airBitCast(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand_ty = self.air.typeOf(ty_op.operand);
         const inst_ty = self.air.typeOfIndex(inst);
@@ -8136,9 +8006,6 @@ pub const FuncGen = struct {
     }
 
     fn airBoolToInt(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst))
-            return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         return operand;
@@ -8188,7 +8055,6 @@ pub const FuncGen = struct {
     }
 
     fn airAlloc(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         const ptr_ty = self.air.typeOfIndex(inst);
         const pointee_type = ptr_ty.childType();
         if (!pointee_type.isFnOrHasRuntimeBitsIgnoreComptime()) return self.dg.lowerPtrToVoid(ptr_ty);
@@ -8200,7 +8066,6 @@ pub const FuncGen = struct {
     }
 
     fn airRetPtr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         const ptr_ty = self.air.typeOfIndex(inst);
         const ret_ty = ptr_ty.childType();
         if (!ret_ty.isFnOrHasRuntimeBitsIgnoreComptime()) return self.dg.lowerPtrToVoid(ptr_ty);
@@ -8288,8 +8153,6 @@ pub const FuncGen = struct {
         const ptr = try fg.resolveInst(ty_op.operand);
 
         elide: {
-            if (ptr_info.@"volatile") break :elide;
-            if (fg.liveness.isUnused(inst)) return null;
             if (!isByRef(ptr_info.pointee_type)) break :elide;
             if (!canElideLoad(fg, body_tail)) break :elide;
             return ptr;
@@ -8313,8 +8176,7 @@ pub const FuncGen = struct {
     }
 
     fn airRetAddr(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
+        _ = inst;
         const llvm_usize = try self.dg.lowerType(Type.usize);
         const target = self.dg.module.getTarget();
         if (!target_util.supportsReturnAddress(target)) {
@@ -8330,8 +8192,7 @@ pub const FuncGen = struct {
     }
 
     fn airFrameAddress(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
+        _ = inst;
         const llvm_i32 = self.context.intType(32);
         const llvm_fn_name = "llvm.frameaddress.p0";
         const llvm_fn = self.dg.object.llvm_module.getNamedFunction(llvm_fn_name) orelse blk: {
@@ -8461,8 +8322,6 @@ pub const FuncGen = struct {
         const ptr = try self.resolveInst(atomic_load.ptr);
         const ptr_ty = self.air.typeOf(atomic_load.ptr);
         const ptr_info = ptr_ty.ptrInfo().data;
-        if (!ptr_info.@"volatile" and self.liveness.isUnused(inst))
-            return null;
         const elem_ty = ptr_info.pointee_type;
         if (!elem_ty.hasRuntimeBitsIgnoreComptime())
             return null;
@@ -8576,8 +8435,6 @@ pub const FuncGen = struct {
     }
 
     fn airGetUnionTag(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const un_ty = self.air.typeOf(ty_op.operand);
         const target = self.dg.module.getTarget();
@@ -8602,8 +8459,6 @@ pub const FuncGen = struct {
     }
 
     fn airUnaryOp(self: *FuncGen, inst: Air.Inst.Index, comptime op: FloatOp) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const operand_ty = self.air.typeOf(un_op);
@@ -8612,7 +8467,6 @@ pub const FuncGen = struct {
     }
 
     fn airNeg(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
 
         const un_op = self.air.instructions.items(.data)[inst].un_op;
@@ -8623,8 +8477,6 @@ pub const FuncGen = struct {
     }
 
     fn airClzCtz(self: *FuncGen, inst: Air.Inst.Index, llvm_fn_name: []const u8) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand_ty = self.air.typeOf(ty_op.operand);
         const operand = try self.resolveInst(ty_op.operand);
@@ -8651,8 +8503,6 @@ pub const FuncGen = struct {
     }
 
     fn airBitOp(self: *FuncGen, inst: Air.Inst.Index, llvm_fn_name: []const u8) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand_ty = self.air.typeOf(ty_op.operand);
         const operand = try self.resolveInst(ty_op.operand);
@@ -8678,8 +8528,6 @@ pub const FuncGen = struct {
     }
 
     fn airByteSwap(self: *FuncGen, inst: Air.Inst.Index, llvm_fn_name: []const u8) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.module.getTarget();
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand_ty = self.air.typeOf(ty_op.operand);
@@ -8733,8 +8581,6 @@ pub const FuncGen = struct {
     }
 
     fn airErrorSetHasValue(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const operand = try self.resolveInst(ty_op.operand);
         const error_set_ty = self.air.getRefType(ty_op.ty);
@@ -8780,8 +8626,6 @@ pub const FuncGen = struct {
     }
 
     fn airIsNamedEnumValue(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const enum_ty = self.air.typeOf(un_op);
@@ -8861,8 +8705,6 @@ pub const FuncGen = struct {
     }
 
     fn airTagName(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const enum_ty = self.air.typeOf(un_op);
@@ -8994,8 +8836,6 @@ pub const FuncGen = struct {
     }
 
     fn airErrorName(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const un_op = self.air.instructions.items(.data)[inst].un_op;
         const operand = try self.resolveInst(un_op);
         const slice_ty = self.air.typeOfIndex(inst);
@@ -9010,8 +8850,6 @@ pub const FuncGen = struct {
     }
 
     fn airSplat(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const scalar = try self.resolveInst(ty_op.operand);
         const vector_ty = self.air.typeOfIndex(inst);
@@ -9020,8 +8858,6 @@ pub const FuncGen = struct {
     }
 
     fn airSelect(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const pl_op = self.air.instructions.items(.data)[inst].pl_op;
         const extra = self.air.extraData(Air.Bin, pl_op.payload).data;
         const pred = try self.resolveInst(pl_op.operand);
@@ -9032,8 +8868,6 @@ pub const FuncGen = struct {
     }
 
     fn airShuffle(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const extra = self.air.extraData(Air.Shuffle, ty_pl.payload).data;
         const a = try self.resolveInst(extra.a);
@@ -9133,7 +8967,6 @@ pub const FuncGen = struct {
     }
 
     fn airReduce(self: *FuncGen, inst: Air.Inst.Index, want_fast_math: bool) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
         self.builder.setFastMath(want_fast_math);
         const target = self.dg.module.getTarget();
 
@@ -9220,8 +9053,6 @@ pub const FuncGen = struct {
     }
 
     fn airAggregateInit(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const result_ty = self.air.typeOfIndex(inst);
         const len = @intCast(usize, result_ty.arrayLen());
@@ -9359,8 +9190,6 @@ pub const FuncGen = struct {
     }
 
     fn airUnionInit(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const extra = self.air.extraData(Air.UnionInit, ty_pl.payload).data;
         const union_ty = self.air.typeOfIndex(inst);
@@ -9565,8 +9394,6 @@ pub const FuncGen = struct {
     }
 
     fn airAddrSpaceCast(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const ty_op = self.air.instructions.items(.data)[inst].ty_op;
         const inst_ty = self.air.typeOfIndex(inst);
         const operand = try self.resolveInst(ty_op.operand);
@@ -9591,8 +9418,6 @@ pub const FuncGen = struct {
     }
 
     fn airWorkItemId(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.module.getTarget();
         assert(target.cpu.arch == .amdgcn); // TODO is to port this function to other GPU architectures
 
@@ -9602,8 +9427,6 @@ pub const FuncGen = struct {
     }
 
     fn airWorkGroupSize(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.module.getTarget();
         assert(target.cpu.arch == .amdgcn); // TODO is to port this function to other GPU architectures
 
@@ -9633,8 +9456,6 @@ pub const FuncGen = struct {
     }
 
     fn airWorkGroupId(self: *FuncGen, inst: Air.Inst.Index) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.module.getTarget();
         assert(target.cpu.arch == .amdgcn); // TODO is to port this function to other GPU architectures
 
@@ -9755,8 +9576,6 @@ pub const FuncGen = struct {
         struct_ptr_ty: Type,
         field_index: u32,
     ) !?*llvm.Value {
-        if (self.liveness.isUnused(inst)) return null;
-
         const target = self.dg.object.target;
         const struct_ty = struct_ptr_ty.childType();
         switch (struct_ty.zigTypeTag()) {
