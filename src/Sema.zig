@@ -10413,6 +10413,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                         seen_enum_fields,
                         &range_set,
                         item_ref,
+                        operand_ty,
                         src_node_offset,
                         .{ .scalar = scalar_i },
                     );
@@ -10436,6 +10437,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                             seen_enum_fields,
                             &range_set,
                             item_ref,
+                            operand_ty,
                             src_node_offset,
                             .{ .multi = .{ .prong = multi_i, .item = @intCast(u32, item_i) } },
                         );
@@ -10509,6 +10511,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                         block,
                         &seen_errors,
                         item_ref,
+                        operand_ty,
                         src_node_offset,
                         .{ .scalar = scalar_i },
                     );
@@ -10531,6 +10534,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                             block,
                             &seen_errors,
                             item_ref,
+                            operand_ty,
                             src_node_offset,
                             .{ .multi = .{ .prong = multi_i, .item = @intCast(u32, item_i) } },
                         );
@@ -10646,7 +10650,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                     extra_index += 1;
                     extra_index += body_len;
 
-                    try sema.validateSwitchItem(
+                    try sema.validateSwitchItemInt(
                         block,
                         &range_set,
                         item_ref,
@@ -10669,7 +10673,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                     extra_index += items_len;
 
                     for (items, 0..) |item_ref, item_i| {
-                        try sema.validateSwitchItem(
+                        try sema.validateSwitchItemInt(
                             block,
                             &range_set,
                             item_ref,
@@ -10830,6 +10834,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                         block,
                         &seen_values,
                         item_ref,
+                        operand_ty,
                         src_node_offset,
                         .{ .scalar = scalar_i },
                     );
@@ -10852,6 +10857,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
                             block,
                             &seen_values,
                             item_ref,
+                            operand_ty,
                             src_node_offset,
                             .{ .multi = .{ .prong = multi_i, .item = @intCast(u32, item_i) } },
                         );
@@ -11596,18 +11602,31 @@ fn resolveSwitchItemVal(
     sema: *Sema,
     block: *Block,
     item_ref: Zir.Inst.Ref,
+    /// If not `null`, coerce `item_ref` to this type.
+    coerce_ty: ?Type,
     switch_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
     range_expand: Module.SwitchProngSrc.RangeExpand,
 ) CompileError!TypedValue {
-    const item = try sema.resolveInst(item_ref);
-    const item_ty = sema.typeOf(item);
+    const uncoerced_item = try sema.resolveInst(item_ref);
+
     // Constructing a LazySrcLoc is costly because we only have the switch AST node.
     // Only if we know for sure we need to report a compile error do we resolve the
     // full source locations.
+    const item = if (coerce_ty) |ty| coerced: {
+        break :coerced sema.coerce(block, ty, uncoerced_item, .unneeded) catch |err| switch (err) {
+            error.NeededSourceLocation => {
+                const src = switch_prong_src.resolve(sema.gpa, sema.mod.declPtr(block.src_decl), switch_node_offset, range_expand);
+                _ = try sema.coerce(block, ty, uncoerced_item, src);
+                unreachable;
+            },
+            else => |e| return e,
+        };
+    } else uncoerced_item;
+
     if (sema.resolveConstValue(block, .unneeded, item, "")) |val| {
         try sema.resolveLazyValue(val);
-        return TypedValue{ .ty = item_ty, .val = val };
+        return TypedValue{ .ty = sema.typeOf(item), .val = val };
     } else |err| switch (err) {
         error.NeededSourceLocation => {
             const src = switch_prong_src.resolve(sema.gpa, sema.mod.declPtr(block.src_decl), switch_node_offset, range_expand);
@@ -11628,8 +11647,8 @@ fn validateSwitchRange(
     src_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
-    const first_val = (try sema.resolveSwitchItemVal(block, first_ref, src_node_offset, switch_prong_src, .first)).val;
-    const last_val = (try sema.resolveSwitchItemVal(block, last_ref, src_node_offset, switch_prong_src, .last)).val;
+    const first_val = (try sema.resolveSwitchItemVal(block, first_ref, operand_ty, src_node_offset, switch_prong_src, .first)).val;
+    const last_val = (try sema.resolveSwitchItemVal(block, last_ref, operand_ty, src_node_offset, switch_prong_src, .last)).val;
     if (first_val.compareAll(.gt, last_val, operand_ty, sema.mod)) {
         const src = switch_prong_src.resolve(sema.gpa, sema.mod.declPtr(block.src_decl), src_node_offset, .first);
         return sema.fail(block, src, "range start value is greater than the end value", .{});
@@ -11638,7 +11657,7 @@ fn validateSwitchRange(
     return sema.validateSwitchDupe(block, maybe_prev_src, switch_prong_src, src_node_offset);
 }
 
-fn validateSwitchItem(
+fn validateSwitchItemInt(
     sema: *Sema,
     block: *Block,
     range_set: *RangeSet,
@@ -11647,7 +11666,7 @@ fn validateSwitchItem(
     src_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
-    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, src_node_offset, switch_prong_src, .none)).val;
+    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, operand_ty, src_node_offset, switch_prong_src, .none)).val;
     const maybe_prev_src = try range_set.add(item_val, item_val, operand_ty, switch_prong_src);
     return sema.validateSwitchDupe(block, maybe_prev_src, switch_prong_src, src_node_offset);
 }
@@ -11658,10 +11677,11 @@ fn validateSwitchItemEnum(
     seen_fields: []?Module.SwitchProngSrc,
     range_set: *RangeSet,
     item_ref: Zir.Inst.Ref,
+    operand_ty: Type,
     src_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
-    const item_tv = try sema.resolveSwitchItemVal(block, item_ref, src_node_offset, switch_prong_src, .none);
+    const item_tv = try sema.resolveSwitchItemVal(block, item_ref, operand_ty, src_node_offset, switch_prong_src, .none);
     const field_index = item_tv.ty.enumTagFieldIndex(item_tv.val, sema.mod) orelse {
         const maybe_prev_src = try range_set.add(item_tv.val, item_tv.val, item_tv.ty, switch_prong_src);
         return sema.validateSwitchDupe(block, maybe_prev_src, switch_prong_src, src_node_offset);
@@ -11676,10 +11696,11 @@ fn validateSwitchItemError(
     block: *Block,
     seen_errors: *SwitchErrorSet,
     item_ref: Zir.Inst.Ref,
+    operand_ty: Type,
     src_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
-    const item_tv = try sema.resolveSwitchItemVal(block, item_ref, src_node_offset, switch_prong_src, .none);
+    const item_tv = try sema.resolveSwitchItemVal(block, item_ref, operand_ty, src_node_offset, switch_prong_src, .none);
     // TODO: Do i need to typecheck here?
     const error_name = item_tv.val.castTag(.@"error").?.data.name;
     const maybe_prev_src = if (try seen_errors.fetchPut(error_name, switch_prong_src)) |prev|
@@ -11731,13 +11752,13 @@ fn validateSwitchItemBool(
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
     const mod = sema.mod;
-    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, src_node_offset, switch_prong_src, .none)).val;
+    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, Type.bool, src_node_offset, switch_prong_src, .none)).val;
     if (item_val.toBool(mod)) {
         true_count.* += 1;
     } else {
         false_count.* += 1;
     }
-    if (true_count.* + false_count.* > 2) {
+    if (true_count.* > 1 or false_count.* > 1) {
         const block_src_decl = sema.mod.declPtr(block.src_decl);
         const src = switch_prong_src.resolve(sema.gpa, block_src_decl, src_node_offset, .none);
         return sema.fail(block, src, "duplicate switch value", .{});
@@ -11751,10 +11772,11 @@ fn validateSwitchItemSparse(
     block: *Block,
     seen_values: *ValueSrcMap,
     item_ref: Zir.Inst.Ref,
+    operand_ty: Type,
     src_node_offset: i32,
     switch_prong_src: Module.SwitchProngSrc,
 ) CompileError!void {
-    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, src_node_offset, switch_prong_src, .none)).val;
+    const item_val = (try sema.resolveSwitchItemVal(block, item_ref, operand_ty, src_node_offset, switch_prong_src, .none)).val;
     const kv = (try seen_values.fetchPut(item_val, switch_prong_src)) orelse return;
     return sema.validateSwitchDupe(block, kv.value, switch_prong_src, src_node_offset);
 }
