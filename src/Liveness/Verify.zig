@@ -41,6 +41,7 @@ fn verifyBody(self: *Verify, body: []const Air.Inst.Index) Error!void {
             // no operands
             .arg,
             .alloc,
+            .alloc_scoped,
             .inferred_alloc,
             .inferred_alloc_comptime,
             .ret_ptr,

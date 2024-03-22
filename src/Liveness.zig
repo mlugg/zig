@@ -321,6 +321,7 @@ pub fn categorizeOperand(
 
         .arg,
         .alloc,
+        .alloc_scoped,
         .inferred_alloc,
         .inferred_alloc_comptime,
         .ret_ptr,
@@ -968,6 +969,7 @@ fn analyzeInst(
 
         .arg,
         .alloc,
+        .alloc_scoped,
         .ret_ptr,
         .breakpoint,
         .dbg_stmt,

@@ -3675,7 +3675,8 @@ fn zirAllocExtended(
                 .address_space = target_util.defaultAddressSpace(target, .local),
             },
         });
-        const ptr = try block.addTy(.alloc, ptr_type);
+        if (block.need_debug_scope) |ptr| ptr.* = true;
+        const ptr = try block.addTy(.alloc_scoped, ptr_type);
         if (small.is_const) {
             const ptr_inst = ptr.toIndex().?;
             try sema.maybe_comptime_allocs.put(gpa, ptr_inst, .{ .runtime_index = block.runtime_index });
@@ -4035,7 +4036,8 @@ fn zirAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.I
         .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
     });
     try sema.queueFullTypeResolution(var_ty);
-    const ptr = try block.addTy(.alloc, ptr_type);
+    if (block.need_debug_scope) |ptr| ptr.* = true;
+    const ptr = try block.addTy(.alloc_scoped, ptr_type);
     const ptr_inst = ptr.toIndex().?;
     try sema.maybe_comptime_allocs.put(sema.gpa, ptr_inst, .{ .runtime_index = block.runtime_index });
     try sema.base_allocs.put(sema.gpa, ptr_inst, ptr_inst);
@@ -4059,7 +4061,8 @@ fn zirAllocMut(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
         .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
     });
     try sema.queueFullTypeResolution(var_ty);
-    return block.addTy(.alloc, ptr_type);
+    if (block.need_debug_scope) |ptr| ptr.* = true;
+    return block.addTy(.alloc_scoped, ptr_type);
 }
 
 fn zirAllocInferred(
@@ -4197,8 +4200,9 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             try sema.queueFullTypeResolution(final_elem_ty);
 
             // Change it to a normal alloc.
+            if (block.need_debug_scope) |need_scope| need_scope.* = true;
             sema.air_instructions.set(@intFromEnum(ptr_inst), .{
-                .tag = .alloc,
+                .tag = .alloc_scoped,
                 .data = .{ .ty = final_ptr_ty },
             });
 
@@ -20019,6 +20023,8 @@ fn zirStructInit(
                 .child = result_ty.toIntern(),
                 .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
             });
+            // Address-of temporaries live for the duration of the function, so
+            // we use `alloc` rather than `alloc_scoped` here.
             const alloc = try block.addTy(.alloc, alloc_ty);
             const base_ptr = try sema.optEuBasePtrInit(block, alloc, src);
             const field_ptr = try sema.unionFieldPtr(block, field_src, base_ptr, field_name, field_src, resolved_ty, true);
@@ -20194,6 +20200,8 @@ fn finishStructInit(
             .child = result_ty.toIntern(),
             .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
         });
+        // Address-of temporaries live for the duration of the function, so
+        // we use `alloc` rather than `alloc_scoped` here.
         const alloc = try block.addTy(.alloc, alloc_ty);
         const base_ptr = try sema.optEuBasePtrInit(block, alloc, init_src);
         for (field_inits, 0..) |field_init, i_usize| {
@@ -20333,6 +20341,8 @@ fn structInitAnon(
             .child = tuple_ty,
             .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
         });
+        // Address-of temporaries live for the duration of the function, so
+        // we use `alloc` rather than `alloc_scoped` here.
         const alloc = try block.addTy(.alloc, alloc_ty);
         var extra_index = extra_end;
         for (types, 0..) |field_ty, i_usize| {
@@ -20505,6 +20515,8 @@ fn zirArrayInit(
             .child = result_ty.toIntern(),
             .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
         });
+        // Address-of temporaries live for the duration of the function, so
+        // we use `alloc` rather than `alloc_scoped` here.
         const alloc = try block.addTy(.alloc, alloc_ty);
         const base_ptr = try sema.optEuBasePtrInit(block, alloc, src);
 
@@ -20615,6 +20627,8 @@ fn arrayInitAnon(
             .child = tuple_ty,
             .flags = .{ .address_space = target_util.defaultAddressSpace(target, .local) },
         });
+        // Address-of temporaries live for the duration of the function, so
+        // we use `alloc` rather than `alloc_scoped` here.
         const alloc = try block.addTy(.alloc, alloc_ty);
         for (operands, 0..) |operand, i_usize| {
             const i: u32 = @intCast(i_usize);
@@ -32562,6 +32576,8 @@ fn analyzeRef(
         .child = operand_ty.toIntern(),
         .flags = .{ .address_space = address_space },
     });
+    // Address-of temporaries live for the duration of the function, so
+    // we use `alloc` rather than `alloc_scoped` here.
     const alloc = try block.addTy(.alloc, mut_ptr_type);
     try sema.storePtr(block, src, alloc, operand);
 

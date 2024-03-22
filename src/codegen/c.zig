@@ -3192,6 +3192,7 @@ fn genBodyInner(f: *Function, body: []const Air.Inst.Index) error{ AnalysisFail,
             .is_non_null_ptr => try airIsNull(f, inst, "!=", true),
 
             .alloc            => try airAlloc(f, inst),
+            .alloc_scoped     => try airAlloc(f, inst), // TODO
             .ret_ptr          => try airRetPtr(f, inst),
             .assembly         => try airAsm(f, inst),
             .block            => try airBlock(f, inst),

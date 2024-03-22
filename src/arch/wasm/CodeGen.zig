@@ -1892,6 +1892,7 @@ fn genInst(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         .array_elem_val => func.airArrayElemVal(inst),
         .array_to_slice => func.airArrayToSlice(inst),
         .alloc => func.airAlloc(inst),
+        .alloc_scoped => func.airAlloc(inst), // TODO
         .arg => func.airArg(inst),
         .bitcast => func.airBitcast(inst),
         .block => func.airBlock(inst),

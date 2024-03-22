@@ -2715,6 +2715,8 @@ pub const Intrinsic = enum {
     ptrmask,
     @"threadlocal.address",
     vscale,
+    @"lifetime.start",
+    @"lifetime.end",
 
     // Debug
     @"dbg.declare",
@@ -3812,6 +3814,22 @@ pub const Intrinsic = enum {
                 .{ .kind = .overloaded },
             },
             .attrs = &.{ .nocallback, .nofree, .nosync, .nounwind, .willreturn, .{ .memory = Attribute.Memory.all(.none) } },
+        },
+        .@"lifetime.start" = .{
+            .ret_len = 0,
+            .params = &.{
+                .{ .kind = .{ .type = .i64 } },
+                .{ .kind = .{ .type = .ptr } },
+            },
+            .attrs = &.{ .nocallback, .nofree, .nosync, .nounwind, .willreturn },
+        },
+        .@"lifetime.end" = .{
+            .ret_len = 0,
+            .params = &.{
+                .{ .kind = .{ .type = .i64 } },
+                .{ .kind = .{ .type = .ptr } },
+            },
+            .attrs = &.{ .nocallback, .nofree, .nosync, .nounwind, .willreturn },
         },
 
         .@"dbg.declare" = .{

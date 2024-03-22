@@ -212,9 +212,12 @@ pub const Inst = struct {
         /// and if an overflow happens, ov is 1. Otherwise ov is 0.
         /// Uses the `ty_pl` field. Payload is `Bin`.
         shl_with_overflow,
-        /// Allocates stack local memory.
+        /// Allocates stack local memory which lives for the duration of this function.
         /// Uses the `ty` field.
         alloc,
+        /// Allocates stack local memory which lives for the duration of the containing body.
+        /// Uses the `ty` field.
+        alloc_scoped,
         /// This special instruction only exists temporarily during semantic
         /// analysis and is guaranteed to be unreachable in machine code
         /// backends. It tracks a set of types that have been stored to an
@@ -1361,6 +1364,7 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
         => return Type.bool,
 
         .alloc,
+        .alloc_scoped,
         .ret_ptr,
         .err_return_trace,
         .c_va_start,
@@ -1673,6 +1677,7 @@ pub fn mustLower(air: Air, inst: Air.Inst.Index, ip: *const InternPool) bool {
         .mul_with_overflow,
         .shl_with_overflow,
         .alloc,
+        .alloc_scoped,
         .inferred_alloc,
         .inferred_alloc_comptime,
         .ret_ptr,

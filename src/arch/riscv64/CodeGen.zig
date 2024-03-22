@@ -554,6 +554,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .shr, .shr_exact => try self.airShr(inst),
 
             .alloc           => try self.airAlloc(inst),
+            .alloc_scoped    => try self.airAlloc(inst), // TODO
             .ret_ptr         => try self.airRetPtr(inst),
             .arg             => try self.airArg(inst),
             .assembly        => try self.airAsm(inst),

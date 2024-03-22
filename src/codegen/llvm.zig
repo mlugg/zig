@@ -4769,6 +4769,10 @@ pub const FuncGen = struct {
 
     file: Builder.Metadata,
     scope: Builder.Metadata,
+    scope_lifetimes: std.ArrayListUnmanaged(struct {
+        alloc_size: Builder.Value,
+        alloc_ptr: Builder.Value,
+    }) = .{},
 
     inlined: Builder.DebugLocation = .no_location,
 
@@ -4801,6 +4805,7 @@ pub const FuncGen = struct {
     blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
         parent_bb: Builder.Function.Block.Index,
         breaks: *BreakList,
+        scope_lifetimes_top: u32,
     }),
 
     sync_scope: Builder.SyncScope,
@@ -4817,6 +4822,7 @@ pub const FuncGen = struct {
         self.wip.deinit();
         self.func_inst_table.deinit(self.gpa);
         self.blocks.deinit(self.gpa);
+        self.scope_lifetimes.deinit(self.gpa);
     }
 
     fn todo(self: *FuncGen, comptime format: []const u8, args: anytype) Error {
@@ -4988,6 +4994,7 @@ pub const FuncGen = struct {
                 .is_err_ptr      => try self.airIsErr(inst, .ne, true),
 
                 .alloc          => try self.airAlloc(inst),
+                .alloc_scoped   => try self.airAllocScoped(inst),
                 .ret_ptr        => try self.airRetPtr(inst),
                 .arg            => try self.airArg(inst),
                 .bitcast        => try self.airBitCast(inst),
@@ -5135,13 +5142,17 @@ pub const FuncGen = struct {
         const old_inlined = self.inlined;
         const old_base_line = self.base_line;
         const old_scope = self.scope;
-        defer if (maybe_inline_func) |_| {
-            self.wip.debug_location = self.inlined;
-            self.file = old_file;
-            self.inlined = old_inlined;
-            self.base_line = old_base_line;
-        };
-        defer self.scope = old_scope;
+        const old_scope_lifetimes_len = self.scope_lifetimes.items.len;
+        defer {
+            if (maybe_inline_func) |_| {
+                self.wip.debug_location = self.inlined;
+                self.file = old_file;
+                self.inlined = old_inlined;
+                self.base_line = old_base_line;
+            }
+            self.scope = old_scope;
+            self.scope_lifetimes.shrinkRetainingCapacity(old_scope_lifetimes_len);
+        }
 
         if (maybe_inline_func) |inline_func| {
             const o = self.dg.object;
@@ -5915,6 +5926,7 @@ pub const FuncGen = struct {
         try self.blocks.putNoClobber(self.gpa, inst, .{
             .parent_bb = parent_bb,
             .breaks = &breaks,
+            .scope_lifetimes_top = @intCast(self.scope_lifetimes.items.len),
         });
         defer assert(self.blocks.remove(inst));
 
@@ -5950,6 +5962,17 @@ pub const FuncGen = struct {
         const o = self.dg.object;
         const branch = self.air.instructions.items(.data)[@intFromEnum(inst)].br;
         const block = self.blocks.get(branch.block_inst).?;
+
+        for (self.scope_lifetimes.items[block.scope_lifetimes_top..]) |lifetime| {
+            _ = try self.wip.callIntrinsic(
+                .normal,
+                .none,
+                .@"lifetime.end",
+                &.{},
+                &.{ lifetime.alloc_size, lifetime.alloc_ptr },
+                "",
+            );
+        }
 
         // Add the values to the lists only if the break provides a value.
         const operand_ty = self.typeOf(branch.operand);
@@ -8893,6 +8916,32 @@ pub const FuncGen = struct {
         //const pointee_llvm_ty = try o.lowerType(pointee_type);
         const alignment = ptr_ty.ptrAlignment(mod).toLlvm();
         return self.buildAllocaWorkaround(pointee_type, alignment);
+    }
+
+    fn airAllocScoped(self: *FuncGen, inst: Air.Inst.Index) !Builder.Value {
+        const o = self.dg.object;
+        const mod = o.module;
+        const ptr_ty = self.typeOfIndex(inst);
+        const pointee_type = ptr_ty.childType(mod);
+        if (!pointee_type.isFnOrHasRuntimeBitsIgnoreComptime(mod))
+            return (try o.lowerPtrToVoid(ptr_ty)).toValue();
+
+        const alignment = ptr_ty.ptrAlignment(mod).toLlvm();
+        const alloc = try self.buildAllocaWorkaround(pointee_type, alignment);
+        const alloc_size = try o.builder.intConst(.i64, pointee_type.abiSize(mod));
+        try self.scope_lifetimes.append(self.gpa, .{
+            .alloc_size = alloc_size.toValue(),
+            .alloc_ptr = alloc,
+        });
+        _ = try self.wip.callIntrinsic(
+            .normal,
+            .none,
+            .@"lifetime.start",
+            &.{},
+            &.{ alloc_size.toValue(), alloc },
+            "",
+        );
+        return alloc;
     }
 
     fn airRetPtr(self: *FuncGen, inst: Air.Inst.Index) !Builder.Value {
