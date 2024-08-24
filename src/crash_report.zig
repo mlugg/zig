@@ -154,7 +154,7 @@ fn writeFilePath(file: *Zcu.File, writer: anytype) !void {
 
 pub fn compilerPanic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, maybe_ret_addr: ?usize) noreturn {
     PanicSwitch.preDispatch();
-    @setCold(true);
+    @branchHint(.cold);
     const ret_addr = maybe_ret_addr orelse @returnAddress();
     const stack_ctx: StackContext = .{ .current = .{ .ret_addr = ret_addr } };
     PanicSwitch.dispatch(error_return_trace, stack_ctx, msg);
