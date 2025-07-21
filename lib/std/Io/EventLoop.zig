@@ -29,8 +29,6 @@ const Thread = struct {
     idle_search_index: u32,
     steal_ready_search_index: u32,
 
-    const canceling: ?*Thread = @ptrFromInt(@alignOf(Thread));
-
     threadlocal var self: *Thread = undefined;
 
     fn current() *Thread {
@@ -43,8 +41,14 @@ const Thread = struct {
 
     const List = struct {
         allocated: []Thread,
-        reserved: u32,
+        /// `allocated[0..active]` is the number of `Thread`s which have actually been spawned.
+        /// Usually, this is 1 or more. `deinit` drops it to 0 to signal that no more threads may be
+        /// spawned.
         active: u32,
+        /// Locked while spawning new threads to prevent two threads fighting over the same index.
+        /// `active` is still accessed atomically so that other threads may load it atomically, and
+        /// is incremented only once the thread is ready.
+        spawn_mutex: std.Thread.Mutex,
     };
 };
 
@@ -63,7 +67,11 @@ const Fiber = struct {
     context: Context,
     awaiter: Awaiter.Repr,
     queue_next: ?*Fiber,
-    cancel_thread: ?*Thread,
+    cancelation: Cancelation,
+
+    event_loop: *EventLoop,
+    startFn: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    result_align: Alignment,
 
     const Awaiter = union(enum) {
         none,
@@ -114,7 +122,23 @@ const Fiber = struct {
         };
     };
 
+    const Cancelation = enum(usize) {
+        /// This fiber has been canceled. No further action is needed.
+        canceled,
+        /// This fiber is running. After updating to `.canceled`, no further action is needed.
+        running,
+        /// This fiber is blocked on an I/O operation. After updating to `.canceled`, signal the
+        /// io_uring of this thread via `MSG_RING` to cancel the operation.
+        /// Value is a `*Thread`.
+        _,
+    };
+
     const finished: ?*Fiber = @ptrFromInt(@alignOf(Fiber));
+
+    fn contextPointer(fiber: *Fiber) [*]align(max_context_align.toByteUnits()) u8 {
+        const end = @intFromPtr(fiber.allocatedEnd());
+        return @ptrFromInt(max_context_align.backward(end - max_context_size));
+    }
 
     const max_result_align: Alignment = .@"16";
     const max_result_size = max_result_align.forward(64);
@@ -123,13 +147,15 @@ const Fiber = struct {
     const min_stack_size = 4 * 1024 * 1024;
     const max_context_align: Alignment = .@"16";
     const max_context_size = max_context_align.forward(1024);
-    const allocation_size = std.mem.alignForward(
-        usize,
-        Alignment.of(AsyncClosure).max(max_context_align).forward(
-            max_result_align.forward(@sizeOf(Fiber)) + max_result_size + min_stack_size,
-        ) + @sizeOf(AsyncClosure) + max_context_size,
-        std.heap.page_size_max,
-    );
+    const stack_align: Alignment = .@"16";
+
+    const allocation_size = std.mem.alignForward(usize, s: {
+        var s = @sizeOf(Fiber); // `Fiber` first...
+        s = max_result_align.forward(s) + max_result_size; // ...then result buffer...
+        s = stack_align.forward(s) + min_stack_size; // ...then stack...
+        s = max_context_align.forward(s) + max_context_size; // ...then context!
+        break :s s;
+    }, std.heap.page_size_max);
 
     fn allocate(el: *EventLoop) error{OutOfMemory}!*Fiber {
         return @ptrCast(try el.gpa.alignedAlloc(u8, .of(Fiber), allocation_size));
@@ -153,30 +179,33 @@ const Fiber = struct {
     }
 
     fn enterCancelRegion(fiber: *Fiber, thread: *Thread) error{Canceled}!void {
-        // MLUGG TODO
         if (@cmpxchgStrong(
-            ?*Thread,
-            &fiber.cancel_thread,
-            null,
-            thread,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| {
-            assert(cancel_thread == Thread.canceling);
-            return error.Canceled;
-        }
+            Fiber.Cancelation,
+            &fiber.cancelation,
+            .running,
+            @enumFromInt(@intFromPtr(thread)),
+            .monotonic,
+            .monotonic,
+        )) |cancelation| switch (cancelation) {
+            .running => unreachable,
+            _ => unreachable, // no other thread should be working on this fiber
+            .canceled => return error.Canceled,
+        };
     }
 
     fn exitCancelRegion(fiber: *Fiber, thread: *Thread) void {
-        // MLUGG TODO
         if (@cmpxchgStrong(
-            ?*Thread,
-            &fiber.cancel_thread,
-            thread,
-            null,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| assert(cancel_thread == Thread.canceling);
+            Fiber.Cancelation,
+            &fiber.cancelation,
+            @enumFromInt(@intFromPtr(thread)),
+            .running,
+            .monotonic,
+            .monotonic,
+        )) |cancelation| switch (cancelation) {
+            .running => unreachable, // no other thread should be working on this fiber
+            _ => unreachable, // no other thread should be working on this fiber
+            .canceled => {},
+        };
     }
 
     const Queue = struct { head: *Fiber, tail: *Fiber };
@@ -231,8 +260,8 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
         .main_fiber_buffer = undefined,
         .threads = .{
             .allocated = @ptrCast(allocated_slice[0..threads_size]),
-            .reserved = 1,
             .active = 1,
+            .spawn_mutex = .{},
         },
     };
     const main_fiber: *Fiber = @ptrCast(&el.main_fiber_buffer);
@@ -241,7 +270,11 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
         .context = undefined,
         .awaiter = .wrap(.none),
         .queue_next = null,
-        .cancel_thread = null,
+        .cancelation = .running,
+
+        .event_loop = el,
+        .startFn = undefined, // unused
+        .result_align = undefined, // unused
     };
     const main_thread = &el.threads.allocated[0];
     Thread.self = main_thread;
@@ -274,16 +307,24 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
 }
 
 pub fn deinit(el: *EventLoop) void {
-    // MLUGG TODO (all)
-    const active_threads = @atomicLoad(u32, &el.threads.active, .acquire);
+    // Assert that no fibers are ready to run. Our expectation is that every thread aside from the
+    // current one is waiting for CQEs, so we can tell everyone to exit.
+    const active_threads = @atomicLoad(u32, &el.threads.active, .acquire); // acquire `Thread` fields
     for (el.threads.allocated[0..active_threads]) |*thread| {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
     }
+
+    // Tell the threads that the event loop is exiting. Only one thread -- the main thread -- will
+    // not terminate in response to this message, and will instead yield straight back to us.
     el.yield(null, .exit);
+
+    // We're now thread 0. Wait for all the other threads to terminate.
+    assert(Thread.current() == &el.threads.allocated[0]);
+    for (el.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
+
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @alignCast(@ptrCast(el.threads.allocated.ptr));
     const idle_stack_end_offset = std.mem.alignForward(usize, el.threads.allocated.len * @sizeOf(Thread) + idle_stack_size, std.heap.page_size_max);
-    for (el.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
     el.gpa.free(allocated_ptr[0..idle_stack_end_offset]);
     el.* = undefined;
 }
@@ -326,6 +367,11 @@ fn yield(el: *EventLoop, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage
         &ready_fiber.context
     else
         &thread.idle_context;
+
+    if (pending_task == .exit) {
+        assert(ready_context == &thread.idle_context);
+    }
+
     const message: SwitchMessage = .{
         .contexts = .{
             .prev = thread.current_context,
@@ -347,12 +393,12 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
         }
         assert(fiber == ready_queue.tail);
     }
-    // shared fields of previous `Thread` must be initialized before later ones are marked as active
-    const new_thread_index = @atomicLoad(u32, &el.threads.active, .acquire);
-    for (0..@min(max_idle_search, new_thread_index)) |_| {
+    // acquire shared fields of other `Thread`s
+    const num_threads = @atomicLoad(u32, &el.threads.active, .acquire);
+    for (0..@min(max_idle_search, num_threads)) |_| {
         defer thread.idle_search_index += 1;
-        if (thread.idle_search_index == new_thread_index) thread.idle_search_index = 0;
-        const idle_search_thread = &el.threads.allocated[0..new_thread_index][thread.idle_search_index];
+        if (thread.idle_search_index == num_threads) thread.idle_search_index = 0;
+        const idle_search_thread = &el.threads.allocated[0..num_threads][thread.idle_search_index];
         if (idle_search_thread == thread) continue;
         if (@cmpxchgWeak(
             ?*Fiber,
@@ -381,24 +427,17 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
         return;
     }
     spawn_thread: {
-        // previous failed reservations must have completed before retrying
-        if (new_thread_index == el.threads.allocated.len or @cmpxchgWeak(
-            u32,
-            &el.threads.reserved,
-            new_thread_index,
-            new_thread_index + 1,
-            .acquire,
-            .monotonic,
-        ) != null) break :spawn_thread;
+        el.threads.spawn_mutex.lock();
+        defer el.threads.spawn_mutex.unlock();
+        const new_thread_index = @atomicLoad(u32, &el.threads.active, .monotonic);
+        if (new_thread_index == el.threads.allocated.len) break :spawn_thread;
         const new_thread = &el.threads.allocated[new_thread_index];
-        const next_thread_index = new_thread_index + 1;
         new_thread.* = .{
             .thread = undefined,
             .idle_context = undefined,
             .current_context = &new_thread.idle_context,
             .ready_queue = ready_queue.head,
             .io_uring = IoUring.init(io_uring_entries, 0) catch |err| {
-                @atomicStore(u32, &el.threads.reserved, new_thread_index, .release);
                 // no more access to `thread` after giving up reservation
                 std.log.warn("unable to create worker thread due to io_uring init failure: {s}", .{@errorName(err)});
                 break :spawn_thread;
@@ -411,13 +450,12 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
             .allocator = el.gpa,
         }, threadEntry, .{ el, new_thread_index }) catch |err| {
             new_thread.io_uring.deinit();
-            @atomicStore(u32, &el.threads.reserved, new_thread_index, .release);
             // no more access to `thread` after giving up reservation
             std.log.warn("unable to create worker thread due spawn failure: {s}", .{@errorName(err)});
             break :spawn_thread;
         };
-        // shared fields of `Thread` must be initialized before being marked active
-        @atomicStore(u32, &el.threads.active, next_thread_index, .release);
+        // release shared fields of `new_thread`
+        @atomicStore(u32, &el.threads.active, new_thread_index + 1, .release);
         return;
     }
     // nobody wanted it, so just queue it on ourselves
@@ -434,6 +472,8 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
 fn mainIdle(el: *EventLoop, message: *const SwitchMessage) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Context)))) noreturn {
     message.handle(el);
     el.idle(&el.threads.allocated[0]);
+    // The event loop is terminating. We are the main thread, so must be the single thread to yield
+    // back to the loop so that we can be the one running `deinit`.
     el.yield(@ptrCast(&el.main_fiber_buffer), .nothing);
     unreachable; // switched to dead fiber
 }
@@ -458,6 +498,7 @@ const Completion = struct {
     flags: u32,
 };
 
+/// Returns only when the event loop is being exited with `deinit`.
 fn idle(el: *EventLoop, thread: *Thread) void {
     var maybe_ready_fiber: ?*Fiber = null;
     while (true) {
@@ -486,6 +527,7 @@ fn idle(el: *EventLoop, thread: *Thread) void {
                 return;
             },
             _ => switch (errno(cqe.res)) {
+                // This comes from `cancel`.
                 .INTR => getSqe(&thread.io_uring).* = .{
                     .opcode = .ASYNC_CANCEL,
                     .flags = std.os.linux.IOSQE_CQE_SKIP_SUCCESS,
@@ -670,8 +712,7 @@ const SwitchMessage = struct {
                 }
                 condition_wait.mutex.unlock(el.io());
             },
-            // MLUGG TODO
-            .exit => for (el.threads.allocated[0..@atomicLoad(u32, &el.threads.active, .acquire)]) |*each_thread| {
+            .exit => for (el.threads.allocated[0..@atomicLoad(u32, &el.threads.active, .monotonic)]) |*each_thread| {
                 getSqe(&thread.io_uring).* = .{
                     .opcode = .MSG_RING,
                     .flags = std.os.linux.IOSQE_CQE_SKIP_SUCCESS,
@@ -708,6 +749,9 @@ const Context = switch (builtin.cpu.arch) {
 };
 
 inline fn contextSwitch(message: *const SwitchMessage) *const SwitchMessage {
+    // When we jump to the other context, `&message.contexts` must be in the register for the second
+    // argument of a `callconv(.c)` function. This is because it will be either this function, or
+    // `fiberEntry`, and the latter wants to pass it as the second argument to `fiberEntryInner`.
     return @fieldParentPtr("contexts", switch (builtin.cpu.arch) {
         .aarch64 => asm volatile (
             \\ ldp x0, x2, [x1]
@@ -901,66 +945,51 @@ fn mainIdleEntry() callconv(.naked) void {
     }
 }
 
+/// This is just a small wrapper which calls the function `fiberEntryInner` whose address is on the stack.
 fn fiberEntry() callconv(.naked) void {
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
-            \\ leaq 8(%%rsp), %%rdi
-            \\ jmpq *(%%rsp)
+            \\ movq %%rbp, %%rdi  // `asyncConcurrent` puts the fiber pointer in `rbp`
+            \\ xorq %%rbp, %%rbp
+            \\ jmpq *-8(%%rsp)
         ),
         .aarch64 => asm volatile (
-            \\ mov x0, sp
+            \\ mov x0, fp  // `asyncConcurrent` puts the fiber pointer in `fp`
             \\ ldr x2, [sp, #-8]
             \\ br x2
         ),
         else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
     }
 }
-
-const AsyncClosure = struct {
-    event_loop: *EventLoop,
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    result_align: Alignment,
-
-    fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-        return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
-    }
-
-    fn call(closure: *AsyncClosure, message: *const SwitchMessage) callconv(.withStackAlign(.c, @alignOf(AsyncClosure))) noreturn {
-        message.handle(closure.event_loop);
-        const fiber = closure.fiber;
-        std.log.debug("{*} performing async", .{fiber});
-        closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        const awaiter = @atomicRmw(
-            Fiber.Awaiter.Repr,
-            &fiber.awaiter,
-            .Xchg,
-            .wrap(.finished),
-            .acq_rel, // acquire `Group.pending` if necessary; release `fiber.resultBytes()`
-        ).unwrap();
-        const ready_fiber: ?*Fiber = switch (awaiter) {
-            .finished => unreachable, // hey, you don't get to finish the task! only *i* get to finish the task!
-            .none => null,
-            .fiber => |f| f,
-            .group => |group| ready: {
-                const prev_pending = @atomicRmw(u32, &group.pending, .Sub, 1, .acquire); // acquire `group.awaiter`
-                if (prev_pending == 1) {
-                    // We just decremented it to 0, hence completing the group
-                    break :ready @atomicLoad(*Fiber, &group.awaiter, .monotonic);
-                }
-                break :ready null;
-            },
-        };
-        closure.event_loop.yield(ready_fiber, .nothing);
-        unreachable; // switched to dead fiber
-    }
-
-    fn fromFiber(fiber: *Fiber) *AsyncClosure {
-        return @ptrFromInt(Fiber.max_context_align.max(.of(AsyncClosure)).backward(
-            @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-        ) - @sizeOf(AsyncClosure));
-    }
-};
+/// See `contextSwitch` for details on the second parameter.
+fn fiberEntryInner(fiber: *Fiber, switch_contexts: *const @FieldType(SwitchMessage, "contexts")) callconv(.withStackAlign(.c, Fiber.stack_align.toByteUnits())) noreturn {
+    const message: *const SwitchMessage = @fieldParentPtr("contexts", switch_contexts);
+    message.handle(fiber.event_loop);
+    std.log.debug("{*} performing async", .{fiber});
+    fiber.startFn(fiber.contextPointer(), fiber.resultBytes(fiber.result_align));
+    const awaiter = @atomicRmw(
+        Fiber.Awaiter.Repr,
+        &fiber.awaiter,
+        .Xchg,
+        .wrap(.finished),
+        .acq_rel, // acquire `Group.pending` if necessary; release `fiber.resultBytes()`
+    ).unwrap();
+    const ready_fiber: ?*Fiber = switch (awaiter) {
+        .finished => unreachable, // hey, you don't get to finish the task! only *I* get to finish the task!
+        .none => null,
+        .fiber => |f| f,
+        .group => |group| ready: {
+            const prev_pending = @atomicRmw(u32, &group.pending, .Sub, 1, .acquire); // acquire `group.awaiter`
+            if (prev_pending == 1) {
+                // We just decremented it to 0, hence completing the group
+                break :ready @atomicLoad(*Fiber, &group.awaiter, .monotonic);
+            }
+            break :ready null;
+        },
+    };
+    fiber.event_loop.yield(ready_fiber, .nothing);
+    unreachable; // switched to dead fiber
+}
 
 fn async(
     userdata: ?*anyopaque,
@@ -993,35 +1022,33 @@ fn asyncConcurrent(
     const fiber = try Fiber.allocate(event_loop);
     std.log.debug("allocated {*}", .{fiber});
 
-    const closure: *AsyncClosure = .fromFiber(fiber);
-    const stack_end: [*]align(16) usize = @alignCast(@ptrCast(closure));
-    (stack_end - 1)[0..1].* = .{@intFromPtr(&AsyncClosure.call)};
+    // MLUGG TODO: this is right, but unintuitive. clarify the data layout!
+    const stack_end: [*]align(16) usize = @alignCast(@ptrCast(fiber.contextPointer()));
+    (stack_end - 1)[0..1].* = .{@intFromPtr(&fiberEntryInner)};
     fiber.* = .{
         .required_align = {},
         .context = switch (builtin.cpu.arch) {
             .x86_64 => .{
-                .rsp = @intFromPtr(stack_end - 1),
-                .rbp = 0,
+                .rsp = @intFromPtr(stack_end),
+                .rbp = @intFromPtr(fiber), // initially repurposed to give the 'fiber' arg
                 .rip = @intFromPtr(&fiberEntry),
             },
             .aarch64 => .{
                 .sp = @intFromPtr(stack_end),
-                .fp = 0,
+                .fp = @intFromPtr(fiber), // initially repurposed to give the 'fiber' arg
                 .pc = @intFromPtr(&fiberEntry),
             },
             else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
         },
         .awaiter = .wrap(.none),
         .queue_next = null,
-        .cancel_thread = null,
-    };
-    closure.* = .{
+        .cancelation = .running,
+
         .event_loop = event_loop,
-        .fiber = fiber,
-        .start = start,
+        .startFn = start,
         .result_align = result_alignment,
     };
-    @memcpy(closure.contextPointer(), context);
+    @memcpy(fiber.contextPointer(), context);
 
     event_loop.schedule(.current(), .{ .head = fiber, .tail = fiber });
     return @ptrCast(fiber);
@@ -1167,20 +1194,24 @@ fn cancel(
     result_alignment: Alignment,
 ) void {
     const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
-    if (@atomicRmw(
-        ?*Thread,
-        &future_fiber.cancel_thread,
+    switch (@atomicRmw(
+        Fiber.Cancelation,
+        &future_fiber.cancelation,
         .Xchg,
-        Thread.canceling,
-        .acq_rel, // MLUGG TODO
-    )) |cancel_thread| if (cancel_thread != Thread.canceling) {
-        getSqe(&Thread.current().io_uring).* = .{
+        .canceled,
+        .monotonic,
+    )) {
+        .canceled => {},
+        .running => {},
+        _ => |thread_ptr| getSqe(&Thread.current().io_uring).* = .{
             .opcode = .MSG_RING,
             .flags = std.os.linux.IOSQE_CQE_SKIP_SUCCESS,
             .ioprio = 0,
-            .fd = cancel_thread.io_uring.fd,
+            .fd = @as(*Thread, @ptrFromInt(@intFromEnum(thread_ptr))).io_uring.fd,
+            // This is received as `user_data`.
             .off = @intFromPtr(future_fiber),
             .addr = 0,
+            // This is received as `res`.
             .len = @bitCast(-@as(i32, @intFromEnum(std.os.linux.E.INTR))),
             .rw_flags = 0,
             .user_data = @intFromEnum(Completion.UserData.cleanup),
@@ -1189,15 +1220,19 @@ fn cancel(
             .splice_fd_in = 0,
             .addr3 = 0,
             .resv = 0,
-        };
-    };
+        },
+    }
     await(userdata, any_future, result, result_alignment);
 }
 
 fn cancelRequested(userdata: ?*anyopaque) bool {
     _ = userdata;
-    // MLUGG TODO
-    return @atomicLoad(?*Thread, &Thread.current().currentFiber().cancel_thread, .acquire) == Thread.canceling;
+    const fiber = Thread.current().currentFiber();
+    switch (@atomicLoad(Fiber.Cancelation, &fiber.cancelation, .monotonic)) {
+        .canceled => return true,
+        .running => return false,
+        _ => unreachable, // we are not waiting for IO
+    }
 }
 
 fn createFile(
