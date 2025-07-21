@@ -11,10 +11,6 @@ const IoUring = std.os.linux.IoUring;
 gpa: Allocator,
 main_fiber_buffer: [@sizeOf(Fiber) + Fiber.max_result_size]u8 align(@alignOf(Fiber)),
 threads: Thread.List,
-detached: struct {
-    mutex: std.Io.Mutex,
-    list: std.DoublyLinkedList,
-},
 
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 const idle_stack_size = 256 * 1024;
@@ -52,15 +48,73 @@ const Thread = struct {
     };
 };
 
+const Group = struct {
+    required_align: void align(4),
+    /// 1 higher before `waitForGroup`, so only drops to 0 once `awaiter` is populated. Underflow is
+    /// allowed for versatility, since it allows using this primitive to implement `select`.
+    pending: u32,
+    /// Simpler than `Fiber.awaiter`, because this is not used for synchronization. Instead, whoever
+    /// decrements `pending` to `0` is responsible for scheduling the awaiter.
+    awaiter: *Fiber,
+};
+
 const Fiber = struct {
     required_align: void align(4),
     context: Context,
-    awaiter: ?*Fiber,
+    awaiter: Awaiter.Repr,
     queue_next: ?*Fiber,
     cancel_thread: ?*Thread,
-    awaiting_completions: std.StaticBitSet(3),
 
-    const finished: ?*Fiber = @ptrFromInt(@alignOf(Thread));
+    const Awaiter = union(enum) {
+        none,
+        finished,
+        fiber: *Fiber,
+        group: *Group,
+
+        const Repr = packed struct(usize) {
+            tag: Tag,
+            bits: @Type(.{ .int = .{ .signedness = .unsigned, .bits = @bitSizeOf(usize) - tag_bits } }),
+
+            const Tag = enum(u2) {
+                fiber,
+                group,
+                /// 0: no awaiter
+                /// 1: finished
+                special,
+            };
+            const tag_bits = @bitSizeOf(Tag);
+            comptime {
+                // Ensure we can fit the tag in the known-zero pointer bits
+                for (@typeInfo(Awaiter).@"union".fields) |f| {
+                    if (f.type == void) continue;
+                    const Pointee = @typeInfo(f.type).pointer.child;
+                    assert(@alignOf(Pointee) >= (1 << tag_bits));
+                }
+            }
+
+            fn unwrap(repr: Repr) Awaiter {
+                return switch (repr.tag) {
+                    .special => switch (repr.bits) {
+                        0 => .none,
+                        1 => .finished,
+                        else => unreachable,
+                    },
+                    .fiber => .{ .fiber = @ptrFromInt(repr.bits << tag_bits) },
+                    .group => .{ .group = @ptrFromInt(repr.bits << tag_bits) },
+                };
+            }
+            fn wrap(a: Awaiter) Repr {
+                return switch (a) {
+                    .none => .{ .tag = .special, .bits = 0 },
+                    .finished => .{ .tag = .special, .bits = 1 },
+                    .fiber => |f| .{ .tag = .fiber, .bits = @intCast(@shrExact(@intFromPtr(f), tag_bits)) },
+                    .group => |g| .{ .tag = .group, .bits = @intCast(@shrExact(@intFromPtr(g), tag_bits)) },
+                };
+            }
+        };
+    };
+
+    const finished: ?*Fiber = @ptrFromInt(@alignOf(Fiber));
 
     const max_result_align: Alignment = .@"16";
     const max_result_size = max_result_align.forward(64);
@@ -69,13 +123,11 @@ const Fiber = struct {
     const min_stack_size = 4 * 1024 * 1024;
     const max_context_align: Alignment = .@"16";
     const max_context_size = max_context_align.forward(1024);
-    const max_closure_size: usize = @max(@sizeOf(AsyncClosure), @sizeOf(DetachedClosure));
-    const max_closure_align: Alignment = .max(.of(AsyncClosure), .of(DetachedClosure));
     const allocation_size = std.mem.alignForward(
         usize,
-        max_closure_align.max(max_context_align).forward(
+        Alignment.of(AsyncClosure).max(max_context_align).forward(
             max_result_align.forward(@sizeOf(Fiber)) + max_result_size + min_stack_size,
-        ) + max_closure_size + max_context_size,
+        ) + @sizeOf(AsyncClosure) + max_context_size,
         std.heap.page_size_max,
     );
 
@@ -101,6 +153,7 @@ const Fiber = struct {
     }
 
     fn enterCancelRegion(fiber: *Fiber, thread: *Thread) error{Canceled}!void {
+        // MLUGG TODO
         if (@cmpxchgStrong(
             ?*Thread,
             &fiber.cancel_thread,
@@ -115,6 +168,7 @@ const Fiber = struct {
     }
 
     fn exitCancelRegion(fiber: *Fiber, thread: *Thread) void {
+        // MLUGG TODO
         if (@cmpxchgStrong(
             ?*Thread,
             &fiber.cancel_thread,
@@ -141,7 +195,6 @@ pub fn io(el: *EventLoop) Io {
             .async = async,
             .asyncConcurrent = asyncConcurrent,
             .await = await,
-            .asyncDetached = asyncDetached,
             .select = select,
             .cancel = cancel,
             .cancelRequested = cancelRequested,
@@ -160,6 +213,10 @@ pub fn io(el: *EventLoop) Io {
 
             .now = now,
             .sleep = sleep,
+
+            .createGroup = createGroup,
+            .awaitGroup = awaitGroup,
+            .addToGroup = addToGroup,
         },
     };
 }
@@ -177,19 +234,14 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
             .reserved = 1,
             .active = 1,
         },
-        .detached = .{
-            .mutex = .init,
-            .list = .{},
-        },
     };
     const main_fiber: *Fiber = @ptrCast(&el.main_fiber_buffer);
     main_fiber.* = .{
         .required_align = {},
         .context = undefined,
-        .awaiter = null,
+        .awaiter = .wrap(.none),
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .initEmpty(),
     };
     const main_thread = &el.threads.allocated[0];
     Thread.self = main_thread;
@@ -222,22 +274,7 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
 }
 
 pub fn deinit(el: *EventLoop) void {
-    while (true) cancel(el, detached_future: {
-        el.detached.mutex.lock(el.io()) catch |err| switch (err) {
-            error.Canceled => unreachable, // main fiber cannot be canceled
-        };
-        defer el.detached.mutex.unlock(el.io());
-        const detached: *DetachedClosure = @fieldParentPtr(
-            "detached_queue_node",
-            el.detached.list.pop() orelse break,
-        );
-        // notify the detached fiber that it is no longer allowed to recycle itself
-        detached.detached_queue_node = .{
-            .prev = &detached.detached_queue_node,
-            .next = &detached.detached_queue_node,
-        };
-        break :detached_future @ptrCast(detached.fiber);
-    }, &.{}, .@"1");
+    // MLUGG TODO (all)
     const active_threads = @atomicLoad(u32, &el.threads.active, .acquire);
     for (el.threads.allocated[0..active_threads]) |*thread| {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
@@ -252,6 +289,7 @@ pub fn deinit(el: *EventLoop) void {
 }
 
 fn findReadyFiber(el: *EventLoop, thread: *Thread) ?*Fiber {
+    // MLUGG TODO (all incl cmpxchg)
     if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
         @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
         ready_fiber.queue_next = null;
@@ -300,6 +338,7 @@ fn yield(el: *EventLoop, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage
 }
 
 fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
+    // MLUGG TODO (all incl cmpxchg)
     {
         var fiber = ready_queue.head;
         while (true) {
@@ -492,8 +531,9 @@ const SwitchMessage = struct {
         nothing,
         reschedule,
         recycle,
-        register_awaiter: *?*Fiber,
-        register_select: []const *Io.AnyFuture,
+        register_await_fiber: *Fiber,
+        register_await_group: *Group,
+        register_select: *Group,
         mutex_lock: struct {
             prev_state: Io.Mutex.State,
             mutex: *Io.Mutex,
@@ -520,23 +560,58 @@ const SwitchMessage = struct {
                 assert(prev_fiber.queue_next == null);
                 el.recycle(prev_fiber);
             },
-            .register_awaiter => |awaiter| {
+            .register_await_fiber => |fiber| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.prev));
                 assert(prev_fiber.queue_next == null);
-                if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
-                    el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                switch (@atomicRmw(
+                    Fiber.Awaiter.Repr,
+                    &fiber.awaiter,
+                    .Xchg,
+                    .wrap(.{ .fiber = prev_fiber }),
+                    .acquire, // acquires `fiber.resultBytes()`
+                ).unwrap()) {
+                    .finished => el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber }),
+                    .none => {},
+                    .fiber => unreachable, // assert: no fiber is already awaiting this fiber
+                    .group => unreachable, // assert: no group is already awaiting this fiber
+                }
             },
-            .register_select => |futures| {
+            .register_await_group => |group| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.prev));
                 assert(prev_fiber.queue_next == null);
-                for (futures) |any_future| {
-                    const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
-                    if (@atomicRmw(?*Fiber, &future_fiber.awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished) {
-                        const closure: *AsyncClosure = .fromFiber(future_fiber);
-                        if (!@atomicRmw(bool, &closure.already_awaited, .Xchg, true, .seq_cst)) {
-                            el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-                        }
-                    }
+                @atomicStore(*Fiber, &group.awaiter, prev_fiber, .monotonic);
+                // Subtract the fixed 1 to allow the group to be completed.
+                if (@atomicRmw(
+                    u32,
+                    &group.pending,
+                    .Sub,
+                    1,
+                    .release, // releases `&group.awaiter`
+                ) == 1) {
+                    // We were the one who dropped it to 0, so everything in the group already finished.
+                    el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                }
+            },
+            .register_select => |group| {
+                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.prev));
+                assert(prev_fiber.queue_next == null);
+                @atomicStore(*Fiber, &group.awaiter, prev_fiber, .monotonic);
+                // We started with `group.pending` at 0 so that no decrement would bring it *to* 0.
+                // Now, we increment up to 1 so that the first completion will bring it to 0 and
+                // schedule `prev_fiber`. However, if it was already decremented and underflowed to
+                // a non-zero value, something has already completed and *we* are the one who must
+                // schedule the awaiter.
+                if (@atomicRmw(
+                    u32,
+                    &group.pending,
+                    .Add,
+                    1,
+                    .release, // releases `&group.awaiter`
+                ) != 0) {
+                    // The value was already modified (and underflowed), meaning at least one fiber
+                    // finished. It didn't see zero, so *we* are the one responsible for scheduling
+                    // the awaiter.
+                    el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
                 }
             },
             .mutex_lock => |mutex_lock| {
@@ -546,6 +621,7 @@ const SwitchMessage = struct {
                 while (switch (prev_state) {
                     else => next_state: {
                         prev_fiber.queue_next = @ptrFromInt(@intFromEnum(prev_state));
+                        // MLUGG TODO
                         break :next_state @cmpxchgWeak(
                             Io.Mutex.State,
                             &mutex_lock.mutex.state,
@@ -555,6 +631,7 @@ const SwitchMessage = struct {
                             .acquire,
                         );
                     },
+                    // MLUGG TODO
                     .unlocked => @cmpxchgWeak(
                         Io.Mutex.State,
                         &mutex_lock.mutex.state,
@@ -577,6 +654,7 @@ const SwitchMessage = struct {
                     .tail = prev_fiber,
                     .event = .queued,
                 };
+                // MLUGG TODO
                 if (@cmpxchgStrong(
                     ?*Fiber,
                     @as(*?*Fiber, @ptrCast(&condition_wait.cond.state)),
@@ -592,6 +670,7 @@ const SwitchMessage = struct {
                 }
                 condition_wait.mutex.unlock(el.io());
             },
+            // MLUGG TODO
             .exit => for (el.threads.allocated[0..@atomicLoad(u32, &el.threads.active, .acquire)]) |*each_thread| {
                 getSqe(&thread.io_uring).* = .{
                     .opcode = .MSG_RING,
@@ -842,7 +921,6 @@ const AsyncClosure = struct {
     fiber: *Fiber,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     result_align: Alignment,
-    already_awaited: bool,
 
     fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
         return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
@@ -853,13 +931,27 @@ const AsyncClosure = struct {
         const fiber = closure.fiber;
         std.log.debug("{*} performing async", .{fiber});
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        const awaiter = @atomicRmw(?*Fiber, &fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
-        const ready_awaiter = r: {
-            const a = awaiter orelse break :r null;
-            if (@atomicRmw(bool, &closure.already_awaited, .Xchg, true, .acq_rel)) break :r null;
-            break :r a;
+        const awaiter = @atomicRmw(
+            Fiber.Awaiter.Repr,
+            &fiber.awaiter,
+            .Xchg,
+            .wrap(.finished),
+            .acq_rel, // acquire `Group.pending` if necessary; release `fiber.resultBytes()`
+        ).unwrap();
+        const ready_fiber: ?*Fiber = switch (awaiter) {
+            .finished => unreachable, // hey, you don't get to finish the task! only *i* get to finish the task!
+            .none => null,
+            .fiber => |f| f,
+            .group => |group| ready: {
+                const prev_pending = @atomicRmw(u32, &group.pending, .Sub, 1, .acquire); // acquire `group.awaiter`
+                if (prev_pending == 1) {
+                    // We just decremented it to 0, hence completing the group
+                    break :ready @atomicLoad(*Fiber, &group.awaiter, .monotonic);
+                }
+                break :ready null;
+            },
         };
-        closure.event_loop.yield(ready_awaiter, .nothing);
+        closure.event_loop.yield(ready_fiber, .nothing);
         unreachable; // switched to dead fiber
     }
 
@@ -919,114 +1011,20 @@ fn asyncConcurrent(
             },
             else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
         },
-        .awaiter = null,
+        .awaiter = .wrap(.none),
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .initEmpty(),
     };
     closure.* = .{
         .event_loop = event_loop,
         .fiber = fiber,
         .start = start,
         .result_align = result_alignment,
-        .already_awaited = false,
     };
     @memcpy(closure.contextPointer(), context);
 
     event_loop.schedule(.current(), .{ .head = fiber, .tail = fiber });
     return @ptrCast(fiber);
-}
-
-const DetachedClosure = struct {
-    event_loop: *EventLoop,
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque) void,
-    detached_queue_node: std.DoublyLinkedList.Node,
-
-    fn contextPointer(closure: *DetachedClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-        return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(DetachedClosure));
-    }
-
-    fn call(closure: *DetachedClosure, message: *const SwitchMessage) callconv(.withStackAlign(.c, @alignOf(DetachedClosure))) noreturn {
-        message.handle(closure.event_loop);
-        std.log.debug("{*} performing async detached", .{closure.fiber});
-        closure.start(closure.contextPointer());
-        const awaiter = @atomicRmw(?*Fiber, &closure.fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
-        closure.event_loop.yield(awaiter, pending_task: {
-            closure.event_loop.detached.mutex.lock(closure.event_loop.io()) catch |err| switch (err) {
-                error.Canceled => break :pending_task .nothing,
-            };
-            defer closure.event_loop.detached.mutex.unlock(closure.event_loop.io());
-            if (closure.detached_queue_node.next == &closure.detached_queue_node) break :pending_task .nothing;
-            closure.event_loop.detached.list.remove(&closure.detached_queue_node);
-            break :pending_task .recycle;
-        });
-        unreachable; // switched to dead fiber
-    }
-};
-
-fn asyncDetached(
-    userdata: ?*anyopaque,
-    context: []const u8,
-    context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
-    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
-    assert(context.len <= Fiber.max_context_size); // TODO
-
-    const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
-    const fiber = Fiber.allocate(event_loop) catch {
-        start(context.ptr);
-        return;
-    };
-    std.log.debug("allocated {*}", .{fiber});
-
-    const current_thread: *Thread = .current();
-    const closure: *DetachedClosure = @ptrFromInt(Fiber.max_context_align.max(.of(DetachedClosure)).backward(
-        @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-    ) - @sizeOf(DetachedClosure));
-    const stack_end: [*]align(16) usize = @alignCast(@ptrCast(closure));
-    (stack_end - 1)[0..1].* = .{@intFromPtr(&DetachedClosure.call)};
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .x86_64 => .{
-                .rsp = @intFromPtr(stack_end - 1),
-                .rbp = 0,
-                .rip = @intFromPtr(&fiberEntry),
-            },
-            .aarch64 => .{
-                .sp = @intFromPtr(stack_end),
-                .fp = 0,
-                .pc = @intFromPtr(&fiberEntry),
-            },
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .awaiter = null,
-        .queue_next = null,
-        .cancel_thread = null,
-        .awaiting_completions = .initEmpty(),
-    };
-    closure.* = .{
-        .event_loop = event_loop,
-        .fiber = fiber,
-        .start = start,
-        .detached_queue_node = .{},
-    };
-    {
-        event_loop.detached.mutex.lock(event_loop.io()) catch |err| switch (err) {
-            error.Canceled => {
-                event_loop.recycle(fiber);
-                start(context.ptr);
-                return;
-            },
-        };
-        defer event_loop.detached.mutex.unlock(event_loop.io());
-        event_loop.detached.list.append(&closure.detached_queue_node);
-    }
-    @memcpy(closure.contextPointer(), context);
-
-    event_loop.schedule(current_thread, .{ .head = fiber, .tail = fiber });
 }
 
 fn await(
@@ -1037,46 +1035,129 @@ fn await(
 ) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
     const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
-    if (@atomicLoad(?*Fiber, &future_fiber.awaiter, .acquire) != Fiber.finished)
-        event_loop.yield(null, .{ .register_awaiter = &future_fiber.awaiter });
+    switch (@atomicLoad(
+        Fiber.Awaiter.Repr,
+        &future_fiber.awaiter,
+        .acquire, // acquire `future_fiber.resultBytes()`
+    ).unwrap()) {
+        .finished => {},
+        .none => event_loop.yield(null, .{ .register_await_fiber = future_fiber }),
+        .fiber => unreachable, // assert: no fiber is already awaiting this fiber
+        .group => unreachable, // assert: no group is already awaiting this fiber
+    }
     @memcpy(result, future_fiber.resultBytes(result_alignment));
     event_loop.recycle(future_fiber);
+}
+
+fn createGroup(userdata: ?*anyopaque) Allocator.Error!*Io.AnyGroup {
+    const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
+    // TODO: we could use a `std.heap.MemoryPool` if we need to make/destroy groups more efficiently.
+    const group = try event_loop.gpa.create(Group);
+    group.* = .{
+        .required_align = {},
+        .pending = 1, // we remove this 1 when we await the group
+        .awaiter = undefined,
+    };
+    return @ptrCast(group);
+}
+fn awaitGroup(
+    userdata: ?*anyopaque,
+    any_group: *Io.AnyGroup,
+) void {
+    const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
+    const group: *Group = @alignCast(@ptrCast(any_group));
+    if (@atomicLoad(u32, &group.pending, .monotonic) != 1)
+        event_loop.yield(null, .{ .register_await_group = group });
+    // TODO: we could use a `std.heap.MemoryPool` if we need to make/destroy groups more efficiently.
+    event_loop.gpa.destroy(group);
+}
+fn addToGroup(
+    userdata: ?*anyopaque,
+    any_group: *Io.AnyGroup,
+    any_future: *Io.AnyFuture,
+) void {
+    const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
+    const group: *Group = @alignCast(@ptrCast(any_group));
+    const added_fiber: *Fiber = @alignCast(@ptrCast(any_future));
+    // Add one pending task...
+    assert(@atomicRmw(u32, &group.pending, .Add, 1, .monotonic) > 0); // it is illegal to race group completion
+    switch (@atomicRmw(
+        Fiber.Awaiter.Repr,
+        &added_fiber.awaiter,
+        .Xchg,
+        .wrap(.{ .group = group }),
+        .release, // release `group.pending` (when this fiber finishes it must not decrement `pending` too low!)
+    ).unwrap()) {
+        .finished => {
+            // ...but if this fiber is already done, subtract that task back out and recycle the fiber.
+            assert(@atomicRmw(u32, &group.pending, .Sub, 1, .monotonic) > 1); // it is illegal to race group completion
+            event_loop.recycle(added_fiber);
+        },
+        .none => {},
+        .fiber => unreachable, // assert: no fiber is already awaiting this fiber
+        .group => unreachable, // assert: no group is already awaiting this fiber
+    }
 }
 
 fn select(userdata: ?*anyopaque, futures: []const *Io.AnyFuture) usize {
     const el: *EventLoop = @alignCast(@ptrCast(userdata));
 
-    // Optimization to avoid the yield below.
-    for (futures, 0..) |any_future, i| {
+    // We implement `select` as a `Group` with a different value of `pending`. While we're setting
+    // up it's 0 to prevent any of `futures` from scheduling us while we're still working, then
+    // `SwitchMessage.handle` will increment it to 1 so that any fiber finishing completes it.
+    var group: Group = .{
+        .required_align = {},
+        .pending = 0, // incremented to 1 (allowing completion) by `SwitchMessage.handle`
+        .awaiter = undefined, // set by `SwitchMessage.handle`
+    };
+
+    // We might find that one of `futures` is already completed. In that case, we won't set the
+    // `awaiter` of that element or any after it in `futures`, and we'll populate `early_finish`.
+    const early_finish: ?usize = for (futures, 0..) |any_future, i| {
         const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
-        if (@atomicLoad(?*Fiber, &future_fiber.awaiter, .acquire) == Fiber.finished)
-            return i;
+        if (@cmpxchgStrong(
+            Fiber.Awaiter.Repr,
+            &future_fiber.awaiter,
+            .wrap(.none), // provided the fiber isn't done yet...
+            .wrap(.{ .group = &group }), // ...make `group` its awaiter
+            .release, // `group` is the new awaiter; release `group.pending`
+            .monotonic, // `.finished`; we don't need anything
+        )) |awaiter| switch (awaiter.unwrap()) {
+            .finished => break i,
+            .none => unreachable,
+            .fiber => unreachable, // assert: no fiber is already awaiting this fiber
+            .group => unreachable, // assert: no group is already awaiting this fiber
+        };
+    } else early_finish: {
+        // Everyone is awaiting `group`. Yield and let the event loop increment `group.pending` to 1 so
+        // that any fiber finishing will yield back to us.
+        el.yield(null, .{ .register_select = &group });
+        std.log.debug("back from select yield", .{});
+        break :early_finish null;
+    };
+
+    var finish_idx: ?usize = early_finish;
+    const n_to_reset = early_finish orelse futures.len;
+
+    // Remove everyone's references to `group`, and also find who finished if necessary.
+    for (futures[0..n_to_reset], 0..) |any_future, i| {
+        const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
+        if (@cmpxchgStrong(
+            Fiber.Awaiter.Repr,
+            &future_fiber.awaiter,
+            .wrap(.{ .group = &group }), // provided the fiber isn't done yet...
+            .wrap(.none), // ...remove `group` as its awaiter
+            .monotonic, // removed awaiter; we don't need anything
+            .monotonic, // `.finished`; we don't need anything
+        )) |awaiter| switch (awaiter.unwrap()) {
+            .finished => finish_idx = i, // this fiber finished, it can be our result
+            .none => unreachable,
+            .fiber => unreachable, // assert: no fiber awaits any of `futures` before `select` returns
+            .group => unreachable, // assert: no group awaits any of `futures` before `select` returns
+        };
     }
 
-    el.yield(null, .{ .register_select = futures });
-
-    std.log.debug("back from select yield", .{});
-
-    const my_thread: *Thread = .current();
-    const my_fiber = my_thread.currentFiber();
-    var result: ?usize = null;
-
-    for (futures, 0..) |any_future, i| {
-        const future_fiber: *Fiber = @alignCast(@ptrCast(any_future));
-        if (@cmpxchgStrong(?*Fiber, &future_fiber.awaiter, my_fiber, null, .seq_cst, .seq_cst)) |awaiter| {
-            if (awaiter == Fiber.finished) {
-                if (result == null) result = i;
-            } else if (awaiter) |a| {
-                const closure: *AsyncClosure = .fromFiber(a);
-                closure.already_awaited = false;
-            }
-        } else {
-            const closure: *AsyncClosure = .fromFiber(my_fiber);
-            closure.already_awaited = false;
-        }
-    }
-
-    return result.?;
+    return finish_idx.?;
 }
 
 fn cancel(
@@ -1091,7 +1172,7 @@ fn cancel(
         &future_fiber.cancel_thread,
         .Xchg,
         Thread.canceling,
-        .acq_rel,
+        .acq_rel, // MLUGG TODO
     )) |cancel_thread| if (cancel_thread != Thread.canceling) {
         getSqe(&Thread.current().io_uring).* = .{
             .opcode = .MSG_RING,
@@ -1115,6 +1196,7 @@ fn cancel(
 
 fn cancelRequested(userdata: ?*anyopaque) bool {
     _ = userdata;
+    // MLUGG TODO
     return @atomicLoad(?*Thread, &Thread.current().currentFiber().cancel_thread, .acquire) == Thread.canceling;
 }
 
@@ -1537,6 +1619,7 @@ fn mutexLock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex
 }
 fn mutexUnlock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex) void {
     var maybe_waiting_fiber: ?*Fiber = @ptrFromInt(@intFromEnum(prev_state));
+    // MLUGG TODO
     while (if (maybe_waiting_fiber) |waiting_fiber| @cmpxchgWeak(
         Io.Mutex.State,
         &mutex.state,
@@ -1544,6 +1627,7 @@ fn mutexUnlock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mut
         @enumFromInt(@intFromPtr(waiting_fiber.queue_next)),
         .release,
         .acquire,
+        // MLUGG TODO
     ) else @cmpxchgWeak(
         Io.Mutex.State,
         &mutex.state,
@@ -1575,6 +1659,7 @@ fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) I
     switch (cond_impl.event) {
         .queued => {},
         .wake => |wake| if (fiber.queue_next) |next_fiber| switch (wake) {
+            // MLUGG TODO
             .one => if (@cmpxchgStrong(
                 ?*Fiber,
                 @as(*?*Fiber, @ptrCast(&cond.state)),
@@ -1596,6 +1681,7 @@ fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) I
 
 fn conditionWake(userdata: ?*anyopaque, cond: *Io.Condition, wake: Io.Condition.Wake) void {
     const el: *EventLoop = @alignCast(@ptrCast(userdata));
+    // MLUGG TODO
     const waiting_fiber = @atomicRmw(?*Fiber, @as(*?*Fiber, @ptrCast(&cond.state)), .Xchg, null, .acquire) orelse return;
     waiting_fiber.resultPointer(ConditionImpl).event = .{ .wake = wake };
     el.yield(waiting_fiber, .reschedule);

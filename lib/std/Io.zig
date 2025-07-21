@@ -945,18 +945,6 @@ pub const VTable = struct {
         context_alignment: std.mem.Alignment,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) error{OutOfMemory}!*AnyFuture,
-    /// Executes `start` asynchronously in a manner such that it cleans itself
-    /// up. This mode does not support results, await, or cancel.
-    ///
-    /// Thread-safe.
-    asyncDetached: *const fn (
-        /// Corresponds to `Io.userdata`.
-        userdata: ?*anyopaque,
-        /// Copied and then passed to `start`.
-        context: []const u8,
-        context_alignment: std.mem.Alignment,
-        start: *const fn (context: *const anyopaque) void,
-    ) void,
     /// This function is only called when `async` returns a non-null value.
     ///
     /// Thread-safe.
@@ -1009,6 +997,10 @@ pub const VTable = struct {
 
     now: *const fn (?*anyopaque, clockid: std.posix.clockid_t) ClockGetTimeError!Timestamp,
     sleep: *const fn (?*anyopaque, clockid: std.posix.clockid_t, deadline: Deadline) SleepError!void,
+
+    createGroup: *const fn (?*anyopaque) Allocator.Error!*AnyGroup,
+    awaitGroup: *const fn (?*anyopaque, group: *AnyGroup) void,
+    addToGroup: *const fn (?*anyopaque, group: *AnyGroup, future: *AnyFuture) void,
 };
 
 pub const Cancelable = error{
@@ -1133,32 +1125,87 @@ pub const Deadline = union(enum) {
 pub const ClockGetTimeError = std.posix.ClockGetTimeError || Cancelable;
 pub const SleepError = error{ UnsupportedClock, Unexpected, Canceled };
 
-pub const AnyFuture = opaque {};
-
+/// An in-progress async task (invoked via `async` or `asyncConcurrent`) which will return a value
+/// of type `Result`. Resources associated with this `Future` must be freed by calling `cancel` or
+/// `await` at least once.
 pub fn Future(Result: type) type {
     return struct {
         any_future: ?*AnyFuture,
         result: Result,
 
-        /// Equivalent to `await` but sets a flag observable to application
-        /// code that cancellation has been requested.
+        /// Blocks until the `Future` is completed, and returns the result.
         ///
-        /// Idempotent.
-        pub fn cancel(f: *@This(), io: Io) Result {
-            const any_future = f.any_future orelse return f.result;
-            io.vtable.cancel(io.userdata, any_future, @ptrCast((&f.result)[0..1]), .of(Result));
-            f.any_future = null;
-            return f.result;
-        }
-
+        /// This function is idempotent: calling `await` and/or `cancel` multiple times is legal and
+        /// will return the same result.
         pub fn await(f: *@This(), io: Io) Result {
             const any_future = f.any_future orelse return f.result;
             io.vtable.await(io.userdata, any_future, @ptrCast((&f.result)[0..1]), .of(Result));
             f.any_future = null;
             return f.result;
         }
+
+        /// Equivalent to `await` but sets a flag observable to application code that cancellation
+        /// has been requested. If the `Future` is waiting for an `Io` operation, this may result in
+        /// `error.Canceled` being returned from it. Alternatively, application code may observe the
+        /// flag explicitly with `Io.cancelRequested`.
+        ///
+        /// This does not preclude a "success" result from being returned. Even if the application
+        /// code always returns error when canceled, the future may have already been completed.
+        ///
+        /// This function is idempotent: calling `await` and/or `cancel` multiple times is legal and
+        /// will return the same result.
+        pub fn cancel(f: *@This(), io: Io) Result {
+            const any_future = f.any_future orelse return f.result;
+            io.vtable.cancel(io.userdata, any_future, @ptrCast((&f.result)[0..1]), .of(Result));
+            f.any_future = null;
+            return f.result;
+        }
     };
 }
+/// The internal representation of a `Future`, used by `Io` *implementations*.
+/// Users of the interface are not expected to use this type.
+pub const AnyFuture = opaque {};
+
+/// A collection of `Future(void)`s which can be `await`ed as a group. Futures are added to the
+/// group with `Future(void).merge`.
+///
+/// It is considered valid, and not a resource leak, for arbitrarily many frames to be added to a
+/// group which is not `await`ed until an arbitrary point in time. As such, implementations should
+/// release any resources associated with the added `Future(void)`s at some time after they are
+/// completed, as opposed to always releasing all such resources during `Group.await`.
+pub const Group = struct {
+    /// `null` means we have already awaited.
+    any_group: ?*AnyGroup,
+
+    /// Every `Group` which is `init`ed must be `await`ed. `await` releases any resources associated
+    /// with this `Group`.
+    pub fn init(io: Io) Allocator.Error!Group {
+        const any = try io.vtable.createGroup(io.userdata);
+        return .{ .any_group = any };
+    }
+
+    /// Adds a `Future(void)` to this `Group` such that `await` will not return until it completes.
+    ///
+    /// Transfers ownership of the frame `f` to the group `g`. Neither `cancel` nor `await` is
+    /// legal to call after this function returns. Note that this means that once a future is
+    /// added to a `Group`, it can no longer be canceled.
+    pub fn add(g: *Group, io: Io, f: Future(void)) void {
+        const any_group = g.any_group.?; // assert: not already awaited
+        const any_future = f.any_future orelse return;
+        io.vtable.addToGroup(io.userdata, any_group, any_future);
+    }
+
+    /// Once this function is called, it is illegal to call `add` again. However, this function is
+    /// idempotent: repeated calls to it will immediately return.
+    pub fn await(g: *Group, io: Io) void {
+        const any_group = g.any_group orelse return;
+        io.vtable.awaitGroup(io.userdata, any_group);
+        g.any_group = null;
+    }
+};
+/// The internal representation of a `Group`, used by `Io` *implementations*.
+/// Users of the interface are not expected to use this type.
+pub const AnyGroup = opaque {};
 
 pub const Mutex = if (true) struct {
     state: State,
@@ -1568,25 +1615,7 @@ pub fn asyncConcurrent(
     return future;
 }
 
-/// Calls `function` with `args` asynchronously. The resource cleans itself up
-/// when the function returns. Does not support await, cancel, or a return value.
-///
-/// `function` *may* be called immediately, before `async` returns.
-///
-/// See also:
-/// * `async`
-/// * `asyncConcurrent`
-pub fn asyncDetached(io: Io, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
-    const Args = @TypeOf(args);
-    const TypeErased = struct {
-        fn start(context: *const anyopaque) void {
-            const args_casted: *const Args = @alignCast(@ptrCast(context));
-            @call(.auto, function, args_casted.*);
-        }
-    };
-    io.vtable.asyncDetached(io.userdata, @ptrCast((&args)[0..1]), .of(Args), TypeErased.start);
-}
-
+/// Checks whether the calling code has been canceled with `Future.cancel`.
 pub fn cancelRequested(io: Io) bool {
     return io.vtable.cancelRequested(io.userdata);
 }
