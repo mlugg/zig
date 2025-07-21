@@ -19,14 +19,6 @@ parallel_count: usize,
 
 threadlocal var current_closure: ?*AsyncClosure = null;
 
-pub const Runnable = struct {
-    start: Start,
-    node: std.SinglyLinkedList.Node = .{},
-    is_parallel: bool,
-
-    pub const Start = *const fn (*Runnable) void;
-};
-
 pub const InitError = std.Thread.CpuCountError || Allocator.Error;
 
 pub fn init(gpa: Allocator) Pool {
@@ -68,12 +60,17 @@ fn worker(pool: *Pool) void {
     while (true) {
         while (pool.run_queue.popFirst()) |run_node| {
             pool.mutex.unlock();
-            const runnable: *Runnable = @fieldParentPtr("node", run_node);
-            runnable.start(runnable);
+            const closure: *AsyncClosure = @fieldParentPtr("node", run_node);
+            const need_free = closure.start();
             pool.mutex.lock();
-            if (runnable.is_parallel) {
+            if (closure.is_parallel) {
                 // TODO also pop thread and join sometimes
                 pool.parallel_count -= 1;
+            }
+            closure.reset_event.set(); // the closure will be destroyed when ready
+            if (need_free) {
+                // The closure was in a WaitGroup, so it's actually *us* who destroys it!
+                closure.free(pool.allocator, 0);
             }
         }
         if (pool.join_requested) break;
@@ -88,7 +85,6 @@ pub fn io(pool: *Pool) Io {
             .async = async,
             .asyncConcurrent = asyncConcurrent,
             .await = await,
-            .asyncDetached = asyncDetached,
             .cancel = cancel,
             .cancelRequested = cancelRequested,
             .select = select,
@@ -107,20 +103,27 @@ pub fn io(pool: *Pool) Io {
 
             .now = now,
             .sleep = sleep,
+
+            .createGroup = createGroup,
+            .awaitGroup = awaitGroup,
+            .addToGroup = addToGroup,
         },
     };
 }
 
 const AsyncClosure = struct {
     func: *const fn (context: *anyopaque, result: *anyopaque) void,
-    runnable: Runnable,
+    node: std.SinglyLinkedList.Node = .{},
+    is_parallel: bool,
     reset_event: std.Thread.ResetEvent,
     select_condition: ?*std.Thread.ResetEvent,
+    wait_group: ?*WaitGroup,
     cancel_tid: std.Thread.Id,
     context_offset: usize,
     result_offset: usize,
 
     const done_reset_event: *std.Thread.ResetEvent = @ptrFromInt(@alignOf(std.Thread.ResetEvent));
+    const done_wait_group: *WaitGroup = @ptrFromInt(@alignOf(WaitGroup));
 
     const canceling_tid: std.Thread.Id = switch (@typeInfo(std.Thread.Id)) {
         .int => |int_info| switch (int_info.signedness) {
@@ -131,8 +134,9 @@ const AsyncClosure = struct {
         else => @compileError("unsupported std.Thread.Id: " ++ @typeName(std.Thread.Id)),
     };
 
-    fn start(runnable: *Runnable) void {
-        const closure: *AsyncClosure = @alignCast(@fieldParentPtr("runnable", runnable));
+    /// Does not set `closure.reset_event`; that is the caller's responsibility. If this returns
+    /// `true`, the caller should call `closure.free(gpa, 0)` after they finish using `closure`.
+    fn start(closure: *AsyncClosure) bool {
         const tid = std.Thread.getCurrentId();
         if (@cmpxchgStrong(
             std.Thread.Id,
@@ -143,8 +147,7 @@ const AsyncClosure = struct {
             .acquire,
         )) |cancel_tid| {
             assert(cancel_tid == canceling_tid);
-            closure.reset_event.set();
-            return;
+            return false;
         }
         current_closure = closure;
         closure.func(closure.contextPointer(), closure.resultPointer());
@@ -163,12 +166,25 @@ const AsyncClosure = struct {
             &closure.select_condition,
             .Xchg,
             done_reset_event,
-            .release,
+            .monotonic, // results released through `closure.reset_event`
         )) |select_reset| {
             assert(select_reset != done_reset_event);
             select_reset.set();
         }
-        closure.reset_event.set();
+
+        if (@atomicRmw(
+            ?*std.Thread.WaitGroup,
+            &closure.wait_group,
+            .Xchg,
+            done_wait_group,
+            .monotonic, // results released through the WaitGroup
+        )) |wg| {
+            assert(wg != done_wait_group);
+            wg.finish();
+            return true;
+        }
+
+        return false;
     }
 
     fn contextOffset(context_alignment: std.mem.Alignment) usize {
@@ -235,15 +251,13 @@ fn async(
 
     closure.* = .{
         .func = start,
+        .is_parallel = false,
         .context_offset = context_offset,
         .result_offset = result_offset,
         .reset_event = .{},
         .cancel_tid = 0,
         .select_condition = null,
-        .runnable = .{
-            .start = AsyncClosure.start,
-            .is_parallel = false,
-        },
+        .wait_group = null,
     };
 
     @memcpy(closure.contextPointer()[0..context.len], context);
@@ -259,12 +273,12 @@ fn async(
         return null;
     };
 
-    pool.run_queue.prepend(&closure.runnable.node);
+    pool.run_queue.prepend(&closure.node);
 
     if (pool.threads.items.len < thread_capacity) {
         const thread = std.Thread.spawn(.{ .stack_size = pool.stack_size }, worker, .{pool}) catch {
             if (pool.threads.items.len == 0) {
-                assert(pool.run_queue.popFirst() == &closure.runnable.node);
+                assert(pool.run_queue.popFirst() == &closure.node);
                 pool.mutex.unlock();
                 closure.free(gpa, result.len);
                 start(context.ptr, result.ptr);
@@ -303,15 +317,13 @@ fn asyncConcurrent(
 
     closure.* = .{
         .func = start,
+        .is_parallel = true,
         .context_offset = context_offset,
         .result_offset = result_offset,
         .reset_event = .{},
         .cancel_tid = 0,
         .select_condition = null,
-        .runnable = .{
-            .start = AsyncClosure.start,
-            .is_parallel = true,
-        },
+        .wait_group = null,
     };
     @memcpy(closure.contextPointer()[0..context.len], context);
 
@@ -326,11 +338,11 @@ fn asyncConcurrent(
         return error.OutOfMemory;
     };
 
-    pool.run_queue.prepend(&closure.runnable.node);
+    pool.run_queue.prepend(&closure.node);
 
     if (pool.threads.items.len < thread_capacity) {
         const thread = std.Thread.spawn(.{ .stack_size = pool.stack_size }, worker, .{pool}) catch {
-            assert(pool.run_queue.popFirst() == &closure.runnable.node);
+            assert(pool.run_queue.popFirst() == &closure.node);
             pool.mutex.unlock();
             closure.free(gpa, result_len);
             return error.OutOfMemory;
@@ -341,91 +353,6 @@ fn asyncConcurrent(
     pool.mutex.unlock();
     pool.cond.signal();
     return @ptrCast(closure);
-}
-
-const DetachedClosure = struct {
-    pool: *Pool,
-    func: *const fn (context: *anyopaque) void,
-    runnable: Runnable,
-    context_alignment: std.mem.Alignment,
-    context_len: usize,
-
-    fn start(runnable: *Runnable) void {
-        const closure: *DetachedClosure = @alignCast(@fieldParentPtr("runnable", runnable));
-        closure.func(closure.contextPointer());
-        const gpa = closure.pool.allocator;
-        free(closure, gpa);
-    }
-
-    fn free(closure: *DetachedClosure, gpa: Allocator) void {
-        const base: [*]align(@alignOf(DetachedClosure)) u8 = @ptrCast(closure);
-        gpa.free(base[0..contextEnd(closure.context_alignment, closure.context_len)]);
-    }
-
-    fn contextOffset(context_alignment: std.mem.Alignment) usize {
-        return context_alignment.forward(@sizeOf(DetachedClosure));
-    }
-
-    fn contextEnd(context_alignment: std.mem.Alignment, context_len: usize) usize {
-        return contextOffset(context_alignment) + context_len;
-    }
-
-    fn contextPointer(closure: *DetachedClosure) [*]u8 {
-        const base: [*]u8 = @ptrCast(closure);
-        return base + contextOffset(closure.context_alignment);
-    }
-};
-
-fn asyncDetached(
-    userdata: ?*anyopaque,
-    context: []const u8,
-    context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
-    if (builtin.single_threaded) return start(context.ptr);
-    const pool: *Pool = @alignCast(@ptrCast(userdata));
-    const cpu_count = pool.cpu_count catch 1;
-    const gpa = pool.allocator;
-    const n = DetachedClosure.contextEnd(context_alignment, context.len);
-    const closure: *DetachedClosure = @alignCast(@ptrCast(gpa.alignedAlloc(u8, .of(DetachedClosure), n) catch {
-        return start(context.ptr);
-    }));
-    closure.* = .{
-        .pool = pool,
-        .func = start,
-        .context_alignment = context_alignment,
-        .context_len = context.len,
-        .runnable = .{
-            .start = DetachedClosure.start,
-            .is_parallel = false,
-        },
-    };
-    @memcpy(closure.contextPointer()[0..context.len], context);
-
-    pool.mutex.lock();
-
-    const thread_capacity = cpu_count - 1 + pool.parallel_count;
-
-    pool.threads.ensureTotalCapacityPrecise(gpa, thread_capacity) catch {
-        pool.mutex.unlock();
-        closure.free(gpa);
-        return start(context.ptr);
-    };
-
-    pool.run_queue.prepend(&closure.runnable.node);
-
-    if (pool.threads.items.len < thread_capacity) {
-        const thread = std.Thread.spawn(.{ .stack_size = pool.stack_size }, worker, .{pool}) catch {
-            assert(pool.run_queue.popFirst() == &closure.runnable.node);
-            pool.mutex.unlock();
-            closure.free(gpa);
-            return start(context.ptr);
-        };
-        pool.threads.appendAssumeCapacity(thread);
-    }
-
-    pool.mutex.unlock();
-    pool.cond.signal();
 }
 
 fn await(
@@ -454,9 +381,10 @@ fn cancel(
         &closure.cancel_tid,
         .Xchg,
         AsyncClosure.canceling_tid,
-        .acq_rel,
+        .monotonic,
     )) {
-        0, AsyncClosure.canceling_tid => {},
+        AsyncClosure.canceling_tid => unreachable, // assert: future not canceled twice
+        0 => {},
         else => |cancel_tid| switch (builtin.os.tag) {
             .linux => _ = std.os.linux.tgkill(
                 std.os.linux.getpid(),
@@ -473,7 +401,7 @@ fn cancelRequested(userdata: ?*anyopaque) bool {
     const pool: *Pool = @alignCast(@ptrCast(userdata));
     _ = pool;
     const closure = current_closure orelse return false;
-    return @atomicLoad(std.Thread.Id, &closure.cancel_tid, .acquire) == AsyncClosure.canceling_tid;
+    return @atomicLoad(std.Thread.Id, &closure.cancel_tid, .monotonic) == AsyncClosure.canceling_tid;
 }
 
 fn checkCancel(pool: *Pool) error{Canceled}!void {
@@ -717,4 +645,29 @@ fn select(userdata: ?*anyopaque, futures: []const *Io.AnyFuture) usize {
         }
     }
     return result.?;
+}
+
+fn createGroup(userdata: ?*anyopaque) Allocator.Error!*Io.AnyGroup {
+    const pool: *Pool = @alignCast(@ptrCast(userdata));
+    const wg = try pool.allocator.create(WaitGroup);
+    wg.* = .{};
+    return @ptrCast(wg);
+}
+fn awaitGroup(userdata: ?*anyopaque, any_group: *Io.AnyGroup) void {
+    const pool: *Pool = @alignCast(@ptrCast(userdata));
+    const wg: *WaitGroup = @ptrCast(@alignCast(any_group));
+    wg.wait();
+    pool.allocator.destroy(wg);
+}
+fn addToGroup(userdata: ?*anyopaque, any_group: *Io.AnyGroup, any_future: *Io.AnyFuture) void {
+    const pool: *Pool = @alignCast(@ptrCast(userdata));
+    const wg: *WaitGroup = @ptrCast(@alignCast(any_group));
+    const closure: *AsyncClosure = @ptrCast(@alignCast(any_future));
+    wg.start();
+    if (@atomicRmw(?*WaitGroup, &closure.wait_group, .Xchg, wg, .monotonic)) |old_wg| {
+        assert(old_wg == AsyncClosure.done_wait_group); // assert: future not added to two groups
+        wg.finish(); // already done
+        closure.reset_event.wait(); // there might be a little more work for the implementation before we can free
+        closure.free(pool.allocator, 0);
+    }
 }
