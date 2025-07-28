@@ -24,12 +24,28 @@ const Thread = struct {
     thread: std.Thread,
     idle_context: Context,
     current_context: *Context,
-    ready_queue: ?*Fiber,
+    ready_queue_head: ReadyQueueHead,
     io_uring: IoUring,
     idle_search_index: u32,
     steal_ready_search_index: u32,
 
     threadlocal var self: *Thread = undefined;
+
+    const ReadyQueueHead = enum(usize) {
+        /// There's nothing on the queue, so this thread can be given work.
+        empty,
+        /// This thread is currently attempting to pop from its own queue, which cannot be done
+        /// atomically, so this value indicates the in-progress pop to prevent another thread from
+        /// giving or stealing work.
+        popping,
+        /// Value is a `*Fiber`.
+        _,
+
+        fn fiber(maybe_f: ?*Fiber) ReadyQueueHead {
+            const f = maybe_f orelse return .empty;
+            return @enumFromInt(@intFromPtr(f));
+        }
+    };
 
     fn current() *Thread {
         return self;
@@ -132,8 +148,6 @@ const Fiber = struct {
         /// Value is a `*Thread`.
         _,
     };
-
-    const finished: ?*Fiber = @ptrFromInt(@alignOf(Fiber));
 
     fn contextPointer(fiber: *Fiber) [*]align(max_context_align.toByteUnits()) u8 {
         const end = @intFromPtr(fiber.allocatedEnd());
@@ -296,7 +310,7 @@ pub fn init(el: *EventLoop, gpa: Allocator) !void {
             else => @compileError("unimplemented architecture"),
         },
         .current_context = &main_fiber.context,
-        .ready_queue = null,
+        .ready_queue_head = .empty,
         .io_uring = try IoUring.init(io_uring_entries, 0),
         .idle_search_index = 1,
         .steal_ready_search_index = 1,
@@ -311,8 +325,11 @@ pub fn deinit(el: *EventLoop) void {
     // current one is waiting for CQEs, so we can tell everyone to exit.
     const active_threads = @atomicLoad(u32, &el.threads.active, .acquire); // acquire `Thread` fields
     for (el.threads.allocated[0..active_threads]) |*thread| {
-        const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
-        assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
+        switch (@atomicLoad(Thread.ReadyQueueHead, &thread.ready_queue_head, .monotonic)) {
+            .empty => {}, // the thread is out of work, as expected
+            .popping => {}, // a thread is just realising that it's out of work
+            else => unreachable, // there is still pending work
+        }
     }
 
     // Tell the threads that the event loop is exiting. Only one thread -- the main thread -- will
@@ -330,34 +347,51 @@ pub fn deinit(el: *EventLoop) void {
 }
 
 fn findReadyFiber(el: *EventLoop, thread: *Thread) ?*Fiber {
-    // MLUGG TODO (all incl cmpxchg)
-    if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
-        ready_fiber.queue_next = null;
-        return ready_fiber;
+    // If we have a fiber on our ready queue, use that and acquire its fields.
+    switch (@atomicRmw(Thread.ReadyQueueHead, &thread.ready_queue_head, .Xchg, .popping, .acquire)) {
+        .empty => {},
+        .popping => unreachable, // only we can pop from this queue
+        else => |wrapped_ptr| {
+            const ready_fiber: *Fiber = @ptrFromInt(@intFromEnum(wrapped_ptr));
+            // Make the next fiber the head, releasing its fields.
+            @atomicStore(Thread.ReadyQueueHead, &thread.ready_queue_head, .fiber(ready_fiber.queue_next), .release);
+            ready_fiber.queue_next = null;
+            return ready_fiber;
+        },
     }
-    const active_threads = @atomicLoad(u32, &el.threads.active, .acquire);
+    // `thread.ready_queue_head` is currently `.popping`; we must set it before we return.
+    const active_threads = @atomicLoad(u32, &el.threads.active, .acquire); // acquire `Thread` fields
     for (0..@min(max_steal_ready_search, active_threads)) |_| {
         defer thread.steal_ready_search_index += 1;
         if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
         const steal_ready_search_thread = &el.threads.allocated[0..active_threads][thread.steal_ready_search_index];
         if (steal_ready_search_thread == thread) continue;
-        const ready_fiber = @atomicLoad(?*Fiber, &steal_ready_search_thread.ready_queue, .acquire) orelse continue;
-        if (ready_fiber == Fiber.finished) continue;
+        const ready_fiber: *Fiber = switch (@atomicLoad(
+            Thread.ReadyQueueHead,
+            &steal_ready_search_thread.ready_queue_head,
+            .monotonic, // don't acquire the fiber's fields yet, we'll do that below
+        )) {
+            .empty => continue, // this thread has no work for us
+            .popping => continue, // this thread is currently popping from its ready queue; we can't steal from it
+            else => |wrapped| @ptrFromInt(@intFromEnum(wrapped)),
+        };
+        // We know that the thread does have a non-empty ready queue; try to steal it!
         if (@cmpxchgWeak(
-            ?*Fiber,
-            &steal_ready_search_thread.ready_queue,
+            Thread.ReadyQueueHead,
+            &steal_ready_search_thread.ready_queue_head,
             ready_fiber,
-            null,
-            .acquire,
-            .monotonic,
-        )) |_| continue;
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
+            .empty, // we're trying to steal *all* of the work
+            .acquire, // if we succeed in stealing the work, acquire the ready fiber's state
+            .monotonic, // if we fail, nothing to do
+        )) |_| continue; // if we fail (i.e. there's a race and someone gets this work before us), give up on this thread
+        // We'll work on the head of the stolen queue, but make the tail *our* queue, and release
+        // the fields of those other fibers.
+        @atomicStore(Thread.ReadyQueueHead, &thread.ready_queue_head, ready_fiber.queue_next, .release);
         ready_fiber.queue_next = null;
         return ready_fiber;
     }
-    // couldn't find anything to do, so we are now open for business
-    @atomicStore(?*Fiber, &thread.ready_queue, null, .monotonic);
+    // couldn't find anything to do, so give up and let other threads give us work if they want
+    @atomicStore(Thread.ReadyQueueHead, &thread.ready_queue_head, .empty, .monotonic);
     return null;
 }
 
@@ -383,8 +417,8 @@ fn yield(el: *EventLoop, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage
     contextSwitch(&message).handle(el);
 }
 
+/// Schedules every `Fiber` in `ready_queue` to run, because something they were waiting for is done.
 fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
-    // MLUGG TODO (all incl cmpxchg)
     {
         var fiber = ready_queue.head;
         while (true) {
@@ -400,12 +434,13 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
         if (thread.idle_search_index == num_threads) thread.idle_search_index = 0;
         const idle_search_thread = &el.threads.allocated[0..num_threads][thread.idle_search_index];
         if (idle_search_thread == thread) continue;
+        // If this thread's work queue is empty, give it this work and wake up.
         if (@cmpxchgWeak(
-            ?*Fiber,
-            &idle_search_thread.ready_queue,
-            null,
-            ready_queue.head,
-            .release,
+            Thread.ReadyQueueHead,
+            &idle_search_thread.ready_queue_head,
+            .empty,
+            .fiber(ready_queue.head),
+            .release, // if we give the thread work, release the `Fiber` fields to it
             .monotonic,
         )) |_| continue;
         getSqe(&thread.io_uring).* = .{
@@ -426,9 +461,13 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
         };
         return;
     }
+    // If we've not spawned our maximum thread count yet, spawn a new one
     spawn_thread: {
+        if (num_threads == el.threads.allocated.len) break :spawn_thread;
+        // To actually spawn, we need to hold the lock
         el.threads.spawn_mutex.lock();
         defer el.threads.spawn_mutex.unlock();
+        // Someone might have raced to spawn a thread; re-fetch count and check there's still one pending
         const new_thread_index = @atomicLoad(u32, &el.threads.active, .monotonic);
         if (new_thread_index == el.threads.allocated.len) break :spawn_thread;
         const new_thread = &el.threads.allocated[new_thread_index];
@@ -436,7 +475,7 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
             .thread = undefined,
             .idle_context = undefined,
             .current_context = &new_thread.idle_context,
-            .ready_queue = ready_queue.head,
+            .ready_queue_head = .fiber(ready_queue.head),
             .io_uring = IoUring.init(io_uring_entries, 0) catch |err| {
                 // no more access to `thread` after giving up reservation
                 std.log.warn("unable to create worker thread due to io_uring init failure: {s}", .{@errorName(err)});
@@ -460,13 +499,17 @@ fn schedule(el: *EventLoop, thread: *Thread, ready_queue: Fiber.Queue) void {
     }
     // nobody wanted it, so just queue it on ourselves
     while (@cmpxchgWeak(
-        ?*Fiber,
-        &thread.ready_queue,
-        ready_queue.tail.queue_next,
+        Fiber.ReadyQueueHead,
+        &thread.ready_queue_head,
+        .fiber(ready_queue.tail.queue_next),
         ready_queue.head,
-        .acq_rel,
-        .acquire,
-    )) |old_head| ready_queue.tail.queue_next = old_head;
+        .acq_rel, // on success, acquire fields of currently-queued fibers, and release those plus fields of the newly-queued fibers
+        .monotonic, // on failure, do nothing; we'll acquire fields of `Fiber` when we succeed
+    )) |old_head| switch (old_head) {
+        .popping => unreachable, // only we can pop from this queue
+        .empty => ready_queue.tail.queue_next = null,
+        _ => ready_queue.tail.queue_next = @ptrFromInt(@intFromEnum(old_head)),
+    };
 }
 
 fn mainIdle(el: *EventLoop, message: *const SwitchMessage) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Context)))) noreturn {
@@ -659,34 +702,40 @@ const SwitchMessage = struct {
             .mutex_lock => |mutex_lock| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.prev));
                 assert(prev_fiber.queue_next == null);
-                var prev_state = mutex_lock.prev_state;
-                while (switch (prev_state) {
-                    else => next_state: {
+
+                prev_state: switch (mutex_lock.prev_state) {
+                    else => |prev_state| {
                         prev_fiber.queue_next = @ptrFromInt(@intFromEnum(prev_state));
-                        // MLUGG TODO
-                        break :next_state @cmpxchgWeak(
+                        if (@cmpxchgWeak(
                             Io.Mutex.State,
                             &mutex_lock.mutex.state,
                             prev_state,
-                            @enumFromInt(@intFromPtr(prev_fiber)),
-                            .release,
-                            .acquire,
-                        );
+                            @enumFromInt(@intFromEnum(prev_fiber)),
+                            .release, // on success, release our `queue_next`
+                            .monotonic, // on failure, we don't need anything, we'll just try again
+                        )) |new_state| {
+                            // Someone changed the state before us.
+                            continue :prev_state new_state;
+                        }
+                        // We added ourselves to the list of fibers waiting for the lock.
                     },
-                    // MLUGG TODO
-                    .unlocked => @cmpxchgWeak(
-                        Io.Mutex.State,
-                        &mutex_lock.mutex.state,
-                        .unlocked,
-                        .locked_once,
-                        .acquire,
-                        .acquire,
-                    ) orelse {
+                    .unlocked => {
+                        if (@cmpxchgWeak(
+                            Io.Mutex.State,
+                            &mutex_lock.mutex.state,
+                            .unlocked,
+                            .locked_once,
+                            .acquire, // on success, we acquire a lock
+                            .monotonic, // on failure, we don't need anything, we'll just try again
+                        )) |new_state| {
+                            // Someone changed the state before us.
+                            continue :prev_state new_state;
+                        }
+                        // We managed to lock the mutex!
                         prev_fiber.queue_next = null;
                         el.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-                        return;
                     },
-                }) |next_state| prev_state = next_state;
+                }
             },
             .condition_wait => |condition_wait| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.prev));
@@ -696,14 +745,13 @@ const SwitchMessage = struct {
                     .tail = prev_fiber,
                     .event = .queued,
                 };
-                // MLUGG TODO
                 if (@cmpxchgStrong(
                     ?*Fiber,
                     @as(*?*Fiber, @ptrCast(&condition_wait.cond.state)),
                     null,
                     prev_fiber,
-                    .release,
-                    .acquire,
+                    .release, // if `prev_fiber` becomes the head of the wait list, release its `ConditionImpl`
+                    .monotonic, // we are already synchronized with the other waiter via `condition_wait.mutex`
                 )) |waiting_fiber| {
                     const waiting_cond_impl = waiting_fiber.?.resultPointer(ConditionImpl);
                     assert(waiting_cond_impl.tail.queue_next == null);
@@ -1022,8 +1070,7 @@ fn asyncConcurrent(
     const fiber = try Fiber.allocate(event_loop);
     std.log.debug("allocated {*}", .{fiber});
 
-    // MLUGG TODO: this is right, but unintuitive. clarify the data layout!
-    const stack_end: [*]align(16) usize = @alignCast(@ptrCast(fiber.contextPointer()));
+    const stack_end: [*]align(16) usize = @ptrCast(fiber.contextPointer());
     (stack_end - 1)[0..1].* = .{@intFromPtr(&fiberEntryInner)};
     fiber.* = .{
         .required_align = {},
@@ -1087,10 +1134,7 @@ fn createGroup(userdata: ?*anyopaque) Allocator.Error!*Io.AnyGroup {
     };
     return @ptrCast(group);
 }
-fn awaitGroup(
-    userdata: ?*anyopaque,
-    any_group: *Io.AnyGroup,
-) void {
+fn awaitGroup(userdata: ?*anyopaque, any_group: *Io.AnyGroup) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
     const group: *Group = @alignCast(@ptrCast(any_group));
     if (@atomicLoad(u32, &group.pending, .monotonic) != 1)
@@ -1098,11 +1142,7 @@ fn awaitGroup(
     // TODO: we could use a `std.heap.MemoryPool` if we need to make/destroy groups more efficiently.
     event_loop.gpa.destroy(group);
 }
-fn addToGroup(
-    userdata: ?*anyopaque,
-    any_group: *Io.AnyGroup,
-    any_future: *Io.AnyFuture,
-) void {
+fn addToGroup(userdata: ?*anyopaque, any_group: *Io.AnyGroup, any_future: *Io.AnyFuture) void {
     const event_loop: *EventLoop = @alignCast(@ptrCast(userdata));
     const group: *Group = @alignCast(@ptrCast(any_group));
     const added_fiber: *Fiber = @alignCast(@ptrCast(any_future));
@@ -1653,27 +1693,46 @@ fn mutexLock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex
     el.yield(null, .{ .mutex_lock = .{ .prev_state = prev_state, .mutex = mutex } });
 }
 fn mutexUnlock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex) void {
-    var maybe_waiting_fiber: ?*Fiber = @ptrFromInt(@intFromEnum(prev_state));
-    // MLUGG TODO
-    while (if (maybe_waiting_fiber) |waiting_fiber| @cmpxchgWeak(
-        Io.Mutex.State,
-        &mutex.state,
-        @enumFromInt(@intFromPtr(waiting_fiber)),
-        @enumFromInt(@intFromPtr(waiting_fiber.queue_next)),
-        .release,
-        .acquire,
-        // MLUGG TODO
-    ) else @cmpxchgWeak(
-        Io.Mutex.State,
-        &mutex.state,
-        .locked_once,
-        .unlocked,
-        .release,
-        .acquire,
-    ) orelse return) |next_state| maybe_waiting_fiber = @ptrFromInt(@intFromEnum(next_state));
-    maybe_waiting_fiber.?.queue_next = null;
     const el: *EventLoop = @alignCast(@ptrCast(userdata));
-    el.yield(maybe_waiting_fiber.?, .reschedule);
+    var maybe_waiting_fiber: ?*Fiber = @ptrFromInt(@intFromEnum(prev_state));
+    while (true) {
+        const waiting_fiber = maybe_waiting_fiber orelse {
+            // There's nobody waiting right now.
+            if (@cmpxchgWeak(
+                Io.Mutex.State,
+                &mutex.state,
+                .locked_once,
+                .unlocked,
+                .release, // on success, we release a lock
+                .acquire, // on failure, acquire fields of the `Fiber` contending the lock
+            )) |new_state| {
+                // We lost the race; someone else is trying to lock the mutex. We'll try again, this
+                // time yielding to that blocked fiber if we win.
+                maybe_waiting_fiber = @ptrFromInt(@intFromEnum(new_state));
+                continue;
+            }
+            // We won the race, so there's nobody to wake.
+            return;
+        };
+        // `waiting_fiber` is next in line to lock the mutex; assuming no races, we'll yield to them.
+        if (@cmpxchgWeak(
+            Io.Mutex.State,
+            &mutex.state,
+            @enumFromInt(@intFromPtr(waiting_fiber)),
+            @enumFromInt(@intFromPtr(waiting_fiber.queue_next)),
+            .release, // on success, release fields of `queue_next`, plus release a lock
+            .acquire, // on failure, acquire fields of the `Fiber` contending the lock
+        )) |new_state| {
+            // Someone raced us to also contend the lock. Mark *them* as next in line and try again.
+            maybe_waiting_fiber = @ptrFromInt(@intFromEnum(new_state));
+            continue;
+        }
+        // We've just given the lock to `waiting_fiber`; yield to that fiber so it can do its work.
+        // But pass `.reschedule` because *this* fiber is still happy to run (not waiting on anything).
+        waiting_fiber.queue_next = null;
+        el.yield(waiting_fiber, .reschedule);
+        return;
+    }
 }
 
 const ConditionImpl = struct {
@@ -1684,6 +1743,10 @@ const ConditionImpl = struct {
     },
 };
 
+/// `cond.state` is a `?*Fiber` which is the head of a list of waiters formed by the `Fiber.queue_next` field.
+/// The head of that list (`cond.state`) has a `ConditionImpl` in its `resultPointer`. When the condition is
+/// signaled, the head of the list is woken up, and its `ConditionImpl.event` will tell it whether it needs
+/// to also schedule any other waiters (after locking its mutex again).
 fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) Io.Cancelable!void {
     const el: *EventLoop = @alignCast(@ptrCast(userdata));
     el.yield(null, .{ .condition_wait = .{ .cond = cond, .mutex = mutex } });
@@ -1694,14 +1757,13 @@ fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) I
     switch (cond_impl.event) {
         .queued => {},
         .wake => |wake| if (fiber.queue_next) |next_fiber| switch (wake) {
-            // MLUGG TODO
             .one => if (@cmpxchgStrong(
                 ?*Fiber,
                 @as(*?*Fiber, @ptrCast(&cond.state)),
                 null,
                 next_fiber,
-                .release,
-                .acquire,
+                .release, // if `next_fiber` became the head of the wait list, release *its* `ConditionImpl` and `queue_next`
+                .monotonic, // we are already synchronized with the other waiter via `mutex`
             )) |old_fiber| {
                 const old_cond_impl = old_fiber.?.resultPointer(ConditionImpl);
                 assert(old_cond_impl.tail.queue_next == null);
@@ -1716,9 +1778,12 @@ fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) I
 
 fn conditionWake(userdata: ?*anyopaque, cond: *Io.Condition, wake: Io.Condition.Wake) void {
     const el: *EventLoop = @alignCast(@ptrCast(userdata));
-    // MLUGG TODO
+    // Replace the head of the wait list, acquiring the head's `ConditionImpl`.
     const waiting_fiber = @atomicRmw(?*Fiber, @as(*?*Fiber, @ptrCast(&cond.state)), .Xchg, null, .acquire) orelse return;
+    // This store doesn't need to be atomic: the `ConditionImpl` isn't accessed by the waiter until they are rescheduled.
     waiting_fiber.resultPointer(ConditionImpl).event = .{ .wake = wake };
+    // Let the head run -- depending on `wake`, they will schedule the rest of the list if necessary, or otherwise update
+    // the condition to put the rest of the list back as waiters.
     el.yield(waiting_fiber, .reschedule);
 }
 

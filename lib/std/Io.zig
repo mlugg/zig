@@ -1167,9 +1167,10 @@ pub fn Future(Result: type) type {
 pub const AnyFuture = opaque {};
 
 /// A collection of `Future(void)`s which can be `await`ed as a group. Futures are added to the
-/// group with `Future(void).merge`.
+/// group with `add`, which takes ownership of the `Future(void)`, making any further operations on
+/// it illegal.
 ///
-/// It is considered valid, and not a resource leak, for arbitrarily many frames to be added to a
+/// It is considered valid, and not a resource leak, for arbitrarily many futures to be added to a
 /// group which is not `await`ed until an arbitrary point in time. As such, implementations should
 /// release any resources associated with the added `Future(void)`s at some time after they are
 /// completed, as opposed to always releasing all such resources during `Group.await`.
@@ -1186,17 +1187,19 @@ pub const Group = struct {
 
     /// Adds a `Future(void)` to this `Group` such that `await` will not return until it completes.
     ///
-    /// Transfers ownership of the frame `f` to the group `g`. Neither `cancel` nor `await` is
-    /// legal to call after this function returns. Note that this means that once a future is
-    /// added to a `Group`, it can no longer be canceled.
+    /// Transfers ownership of the future `f` to the group `g`. Neither `f.cancel` nor `f.await` is
+    /// legal to call after this function returns. Note that this means that once a future is added
+    /// to a `Group`, it can no longer be canceled by any means.
     pub fn add(g: *Group, io: Io, f: Future(void)) void {
         const any_group = g.any_group.?; // assert: not already awaited
         const any_future = f.any_future orelse return;
         io.vtable.addToGroup(io.userdata, any_group, any_future);
     }
 
-    /// Once this function is called, it is illegal to call `add` again. However, this function is
-    /// idempotent: repeated calls to it will immediately return.
+    /// Waits for all futures in this `Group` to complete, then releases any resources associated
+    /// with the `Group` before returning. Every `Group` must be `await`ed. Once this function is
+    /// called, it is illegal to call `g.add` again. However, this function is idempotent: repeated
+    /// calls to it are legal and will immediately return.
     pub fn await(g: *Group, io: Io) void {
         const any_group = g.any_group orelse return;
         io.vtable.awaitGroup(io.userdata, any_group);
@@ -1296,8 +1299,6 @@ pub const Mutex = if (true) struct {
     }
 };
 
-/// Supports exactly 1 waiter. More than 1 simultaneous wait on the same
-/// condition is illegal.
 pub const Condition = struct {
     state: u64 = 0,
 
