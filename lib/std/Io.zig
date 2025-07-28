@@ -935,7 +935,7 @@ pub const VTable = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ?*AnyFuture,
     /// Thread-safe.
-    asyncConcurrent: *const fn (
+    concurrent: *const fn (
         /// Corresponds to `Io.userdata`.
         userdata: ?*anyopaque,
         result_len: usize,
@@ -1125,9 +1125,9 @@ pub const Deadline = union(enum) {
 pub const ClockGetTimeError = std.posix.ClockGetTimeError || Cancelable;
 pub const SleepError = error{ UnsupportedClock, Unexpected, Canceled };
 
-/// An in-progress async task (invoked via `async` or `asyncConcurrent`) which will return a value
-/// of type `Result`. Resources associated with this `Future` must be freed by calling `cancel` or
-/// `await` at least once.
+/// An in-progress task (invoked via `async` or `concurrent`) which will return a value of type
+/// `Result`. Resources associated with this `Future` must be freed by calling `cancel` or `await`
+/// at least once.
 pub fn Future(Result: type) type {
     return struct {
         any_future: ?*AnyFuture,
@@ -1552,11 +1552,7 @@ pub fn Queue(Elem: type) type {
 /// not guaranteed to be available until `await` is called.
 ///
 /// `function` *may* be called immediately, before `async` returns. This has
-/// weaker guarantees than `asyncConcurrent`, making more portable and
-/// reusable.
-///
-/// See also:
-/// * `asyncDetached`
+/// weaker guarantees than `concurrent`, making it more portable and reusable.
 pub fn async(
     io: Io,
     function: anytype,
@@ -1584,13 +1580,14 @@ pub fn async(
 }
 
 /// Calls `function` with `args`, such that the return value of the function is
-/// not guaranteed to be available until `await` is called, allowing the caller
-/// to progress while waiting for any `Io` operations.
+/// not guaranteed to be available until `await` is called. In addition, and in
+/// contrast with `async`, it is guaranteed that the caller can progress while
+/// `function` is waiting for any `Io` operations.
 ///
-/// This has stronger guarantee than `async`, placing restrictions on what kind
-/// of `Io` implementations are supported. By calling `async` instead, one
-/// allows, for example, stackful single-threaded blocking I/O.
-pub fn asyncConcurrent(
+/// This stronger guarantee means that using this function places restrictions
+/// on what kinds of `Io` implementations are supported. By calling `async`
+/// instead, one allows, for example, single-threaded blocking I/O.
+pub fn concurrent(
     io: Io,
     function: anytype,
     args: std.meta.ArgsTuple(@TypeOf(function)),
@@ -1605,7 +1602,7 @@ pub fn asyncConcurrent(
         }
     };
     var future: Future(Result) = undefined;
-    future.any_future = try io.vtable.asyncConcurrent(
+    future.any_future = try io.vtable.concurrent(
         io.userdata,
         @sizeOf(Result),
         .of(Result),

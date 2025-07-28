@@ -236,7 +236,7 @@ pub fn io(el: *EventLoop) Io {
         .userdata = el,
         .vtable = &.{
             .async = async,
-            .asyncConcurrent = asyncConcurrent,
+            .concurrent = concurrent,
             .await = await,
             .select = select,
             .cancel = cancel,
@@ -997,12 +997,12 @@ fn mainIdleEntry() callconv(.naked) void {
 fn fiberEntry() callconv(.naked) void {
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
-            \\ movq %%rbp, %%rdi  // `asyncConcurrent` puts the fiber pointer in `rbp`
+            \\ movq %%rbp, %%rdi  // `concurrent` puts the fiber pointer in `rbp`
             \\ xorq %%rbp, %%rbp
             \\ jmpq *-8(%%rsp)
         ),
         .aarch64 => asm volatile (
-            \\ mov x0, fp  // `asyncConcurrent` puts the fiber pointer in `fp`
+            \\ mov x0, fp  // `concurrent` puts the fiber pointer in `fp`
             \\ ldr x2, [sp, #-8]
             \\ br x2
         ),
@@ -1047,13 +1047,13 @@ fn async(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*std.Io.AnyFuture {
-    return asyncConcurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
+    return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
         start(context.ptr, result.ptr);
         return null;
     };
 }
 
-fn asyncConcurrent(
+fn concurrent(
     userdata: ?*anyopaque,
     result_len: usize,
     result_alignment: Alignment,
